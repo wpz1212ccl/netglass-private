@@ -1,9 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod anim;
 mod netmon;
 mod probe;
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -19,6 +20,14 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 static LOCKED: AtomicBool = AtomicBool::new(false);
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 static EXPAND_UNTIL: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+/// 从胶囊展开时记住当时的前台窗口：同一窗口保持 pin，
+/// 一旦用户切到别的页面/应用就立即收回，不被 8s pin 挡住。
+static PIN_FG: AtomicIsize = AtomicIsize::new(0);
+/// 用户双击卡片后手动收回胶囊：在点击胶囊重新展开前，不被"桌面=展开"抢回来。
+static MANUAL_ISLAND: AtomicBool = AtomicBool::new(false);
+/// 手动拖动是否进行中。拖动由独立线程跟随光标移动窗口，
+/// 不再使用 HTCAPTION（系统会把拖动区双击解释成最大化/全屏）。
+static DRAGGING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default, Serialize, Deserialize)]
 struct Config {
@@ -108,19 +117,66 @@ static HOME: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 const HOME_CX: f64 = 0.50;
 const HOME_CY: f64 = 0.215;
 
-fn island_pos(win: &tauri::WebviewWindow) -> (i32, i32) {
+const CARD_W: f64 = 320.0;
+const CARD_H: f64 = 200.0;
+const ISLAND_W: f64 = 144.0;
+const ISLAND_H: f64 = 34.0;
+// 悬浮时窗口弹簧放大到 162x42；窗口始终等于可见胶囊，没有透明留白。
+const ISLAND_HOT_W: f64 = 162.0;
+const ISLAND_HOT_H: f64 = 42.0;
+static ISLAND_HOT: AtomicBool = AtomicBool::new(false);
+/// 最近一次真正显示过的形态（Hidden 之前的），托盘重新显示时用它还原布局。
+static LAST_SHOWN: AtomicU8 = AtomicU8::new(0);
+
+fn card_size(win: &tauri::WebviewWindow) -> (i32, i32) {
+    let scale = win.scale_factor().unwrap_or(1.0);
+    ((CARD_W * scale).round() as i32, (CARD_H * scale).round() as i32)
+}
+
+fn card_rect(win: &tauri::WebviewWindow) -> anim::Rect {
+    let (w, h) = card_size(win);
+    let (x, y) = HOME
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .unwrap_or_else(|| default_home(win));
+    anim::Rect::new(x, y, w, h)
+}
+
+fn island_rect(win: &tauri::WebviewWindow, hot: bool) -> anim::Rect {
     let scale = win.scale_factor().unwrap_or(1.0);
     let sw = unsafe { windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
         windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN,
     ) };
-    let w = (156.0 * scale).round() as i32;
-    ((sw - w) / 2, 0)
+    let (lw, lh) = if hot {
+        (ISLAND_HOT_W, ISLAND_HOT_H)
+    } else {
+        (ISLAND_W, ISLAND_H)
+    };
+    let w = (lw * scale).round() as i32;
+    let h = (lh * scale).round() as i32;
+    anim::Rect::new((sw - w) / 2, 0, w, h)
 }
 
-fn card_size(win: &tauri::WebviewWindow) -> (i32, i32) {
-    let scale = win.scale_factor().unwrap_or(1.0);
-    ((320.0 * scale).round() as i32, (200.0 * scale).round() as i32)
+fn target_rect(win: &tauri::WebviewWindow, mode: UiMode) -> Option<anim::Rect> {
+    match mode {
+        UiMode::Expanded => Some(card_rect(win)),
+        UiMode::Island => Some(island_rect(win, ISLAND_HOT.load(Ordering::Relaxed))),
+        UiMode::Hidden => None,
+    }
 }
+
+const HOVER_MOTION: anim::Motion = anim::Motion::new(0.30, 0.55);
+
+/// 展开：略软、带回弹（damping < 1）；收回：更快、几乎不过冲。
+fn motion_for(mode: UiMode) -> anim::Motion {
+    match mode {
+        UiMode::Expanded => anim::Motion::delayed(0.42, 0.54, 90),
+        UiMode::Island => anim::Motion::delayed(0.34, 0.62, 50),
+        UiMode::Hidden => anim::Motion::new(0.28, 1.0),
+    }
+}
+
 
 fn default_home(win: &tauri::WebviewWindow) -> (i32, i32) {
     let (w, h) = card_size(win);
@@ -164,12 +220,21 @@ fn resolve_home(win: &tauri::WebviewWindow) -> (i32, i32) {
     default_home(win)
 }
 
-/// 只在"展开且可见"时采样窗口位置，避免把胶囊坐标当成桌面位置。
+/// 只在"展开且已落定"时采样窗口位置：形变途中尺寸不是 320x200，
+/// 这时读到的是胶囊/中间帧坐标，不能当成桌面锚点。
 fn remember_expanded_pos(win: &tauri::WebviewWindow) {
     if mode_from_code(MODE.load(Ordering::Relaxed)) != UiMode::Expanded {
         return;
     }
     if !win.is_visible().unwrap_or(false) {
+        return;
+    }
+    let (cw, ch) = card_size(win);
+    let settled = win
+        .inner_size()
+        .map(|s| (s.width as i32 - cw).abs() <= 2 && (s.height as i32 - ch).abs() <= 2)
+        .unwrap_or(false);
+    if !settled {
         return;
     }
     if let (Ok(p), Ok(mut g)) = (win.outer_position(), HOME.lock()) {
@@ -189,44 +254,58 @@ fn fade_out(win: &tauri::WebviewWindow, app: &tauri::AppHandle) {
         return;
     }
     let _ = app.emit("net-leave", ());
-    // 和 index.html 的 .out 过渡时长对齐，等淡出画完再隐藏/改尺寸
-    std::thread::sleep(Duration::from_millis(130));
+    // 和 index.html 的 .out 过渡时长对齐，等淡出画完再隐藏
+    std::thread::sleep(Duration::from_millis(220));
 }
 
 fn apply_mode(win: &tauri::WebviewWindow, app: &tauri::AppHandle, mode: UiMode) {
     use tauri::{LogicalSize, PhysicalPosition};
-    if MODE.swap(mode_code(mode), Ordering::Relaxed) == mode_code(mode) {
+    let code = mode_code(mode);
+    if MODE.swap(code, Ordering::Relaxed) == code {
         return;
     }
-    fade_out(win, app);
+    if mode != UiMode::Hidden {
+        LAST_SHOWN.store(code, Ordering::Relaxed);
+    }
+
     match mode {
         UiMode::Hidden => {
+            ISLAND_HOT.store(false, Ordering::Relaxed);
+            fade_out(win, app);
             let _ = win.hide();
         }
-        UiMode::Expanded => {
-            // 先藏起来再改尺寸：WebView2 会在隐藏期间完成重绘，
-            // 否则切换瞬间会看到旧尺寸画面被拉伸的"双影"。
-            let _ = win.hide();
-            let _ = win.set_size(LogicalSize::new(320.0, 200.0));
-            // 始终回到固定锚点：没有锚点时先算一个，绝不沿用胶囊位置。
-            let home = HOME
-                .lock()
-                .ok()
-                .and_then(|g| *g)
-                .unwrap_or_else(|| default_home(win));
-            let _ = win.set_position(PhysicalPosition::new(home.0, home.1));
-            let _ = win.show();
-            tune_window(win);
-            let _ = app.emit("net-mode", mode_str(mode));
-        }
-        UiMode::Island => {
-            let _ = win.hide();
-            let _ = win.set_size(LogicalSize::new(156.0, 38.0));
-            let (x, y) = island_pos(win);
-            let _ = win.set_position(PhysicalPosition::new(x, y));
-            let _ = win.show();
-            tune_window(win);
-            let _ = app.emit("net-mode", mode_str(mode));
+        UiMode::Expanded | UiMode::Island => {
+            if mode != UiMode::Island {
+                ISLAND_HOT.store(false, Ordering::Relaxed);
+            }
+            let Some(target) = target_rect(win, mode) else { return };
+            if !win.is_visible().unwrap_or(false) {
+                // 从隐藏态直接显示：先把窗口摆到目标矩形，再用 CSS 淡入
+                let (lw, lh) = if mode == UiMode::Island {
+                    (ISLAND_W as f32, ISLAND_H as f32)
+                } else {
+                    (CARD_W as f32, CARD_H as f32)
+                };
+                let _ = win.set_size(LogicalSize::new(lw, lh));
+                let _ = win.set_position(PhysicalPosition::new(target.x, target.y));
+                anim::snap_to(target);
+                let _ = win.show();
+                tune_window(win);
+                let _ = app.emit("net-mode", mode_str(mode));
+            } else {
+                // 内容先退场 -> 窗口矩形弹簧形变 -> 内容再进场（见 net-mode 延迟）
+                let _ = app.emit("net-morph", mode_str(mode));
+                anim::animate_to(target, motion_for(mode));
+                let app2 = app.clone();
+                let delay = if mode == UiMode::Expanded { 360 } else { 250 };
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(delay));
+                    // 期间如果又切了形态，这一帧的内容事件就作废
+                    if MODE.load(Ordering::Relaxed) == code {
+                        let _ = app2.emit("net-mode", mode_str(mode));
+                    }
+                });
+            }
         }
     }
 }
@@ -271,37 +350,39 @@ fn toggle_lock(app: &tauri::AppHandle) {
     let _ = app.emit("net-lock", next);
 }
 
+
+
 fn toggle_visible(app: &tauri::AppHandle) {
+    use tauri::{LogicalSize, PhysicalPosition};
     if let Some(w) = app.get_webview_window("main") {
         if w.is_visible().unwrap_or(false) {
+            ISLAND_HOT.store(false, Ordering::Relaxed);
+            remember_expanded_pos(&w);
             let _ = app.emit("net-leave", ());
             // 托盘回调跑在事件循环线程上，淡出等待放到后台线程，别卡住菜单
             let h = app.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(130));
+                std::thread::sleep(Duration::from_millis(220));
                 if let Some(w) = h.get_webview_window("main") {
                     let _ = w.hide();
                 }
             });
         } else {
+            // 全屏隐藏期间窗口可能停在半形变尺寸：按"最后显示过的形态"
+            // 先把矩形摆正，再用 CSS 淡入。
+            let mode = mode_from_code(LAST_SHOWN.load(Ordering::Relaxed));
+            if let Some(target) = target_rect(&w, mode) {
+                let (lw, lh) = if mode == UiMode::Island {
+                    (ISLAND_W as f32, ISLAND_H as f32)
+                } else {
+                    (CARD_W as f32, CARD_H as f32)
+                };
+                let _ = w.set_size(LogicalSize::new(lw, lh));
+                let _ = w.set_position(PhysicalPosition::new(target.x, target.y));
+                anim::snap_to(target);
+            }
             let _ = w.show();
             tune_window(&w);
-            // 全屏隐藏时不会改窗口尺寸：按当前宽度还原"隐藏前是什么形态"，
-            // 否则可能把展开内容塞进胶囊大小里。
-            let mode = match mode_from_code(MODE.load(Ordering::Relaxed)) {
-                UiMode::Hidden => {
-                    let logical_w = w
-                        .inner_size()
-                        .map(|s| s.width as f64 / w.scale_factor().unwrap_or(1.0))
-                        .unwrap_or(0.0);
-                    if logical_w < 200.0 {
-                        UiMode::Island
-                    } else {
-                        UiMode::Expanded
-                    }
-                }
-                m => m,
-            };
             let _ = app.emit("net-mode", mode_str(mode));
         }
     }
@@ -341,8 +422,8 @@ fn tune_window(win: &tauri::WebviewWindow) {
             4,
         );
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        // 去掉 WS_EX_WINDOWEDGE：它会在窗口四周留 1–2px 深色发丝边。
-        // 加上 WS_EX_NOACTIVATE：点卡片（拖动/展开）不会抢走前台软件的焦点。
+        // 去掉 WS_EX_WINDOWEDGE（1–2px 深色发丝边），加上 NOACTIVATE
+        // （点卡片不抢前台焦点）与 TOOLWINDOW（不进 Alt+Tab）。
         let next = (style | WS_EX_TOOLWINDOW.0 as isize | WS_EX_NOACTIVATE.0 as isize) & !0x100;
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next);
 
@@ -357,10 +438,106 @@ fn tune_window(win: &tauri::WebviewWindow) {
     }
 }
 
+/// 鼠标进入/离开胶囊：窗口做一次小幅弹簧放大。
+#[tauri::command]
+fn island_hover(app: tauri::AppHandle, hot: bool) {
+    ISLAND_HOT.store(hot, Ordering::Relaxed);
+    if mode_from_code(MODE.load(Ordering::Relaxed)) != UiMode::Island {
+        return;
+    }
+    if let Some(w) = app.get_webview_window("main") {
+        if w.is_visible().unwrap_or(false) {
+            anim::animate_to(island_rect(&w, hot), HOVER_MOTION);
+        }
+    }
+}
+
+/// 双击卡片：手动收回顶部胶囊（并解除 pin）。
+#[tauri::command]
+fn collapse_to_island(app: tauri::AppHandle) {
+    MANUAL_ISLAND.store(true, Ordering::Relaxed);
+    if let Ok(mut g) = EXPAND_UNTIL.lock() {
+        *g = None;
+    }
+    if let Some(w) = app.get_webview_window("main") {
+        remember_expanded_pos(&w);
+        apply_mode(&w, &app, UiMode::Island);
+    }
+}
+
+/// 自绘拖动：按下卡片后由独立线程按光标位移移动窗口，松手即停。
+#[tauri::command]
+fn begin_drag(app: tauri::AppHandle) {
+    use windows::Win32::Foundation::{HWND, POINT};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    };
+    if mode_from_code(MODE.load(Ordering::Relaxed)) != UiMode::Expanded {
+        return;
+    }
+    let Some(w) = app.get_webview_window("main") else { return };
+    let (cw, ch) = card_size(&w);
+    let settled = w
+        .inner_size()
+        .map(|s| (s.width as i32 - cw).abs() <= 4 && (s.height as i32 - ch).abs() <= 4)
+        .unwrap_or(false);
+    if !settled || DRAGGING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let (Ok(raw), Ok(pos)) = (w.hwnd(), w.outer_position()) else {
+        DRAGGING.store(false, Ordering::SeqCst);
+        return;
+    };
+    let raw = raw.0 as isize;
+    std::thread::spawn(move || {
+        let hwnd = HWND(raw as *mut std::ffi::c_void);
+        let mut start = POINT::default();
+        let _ = unsafe { GetCursorPos(&mut start) };
+        let (mut lx, mut ly) = (pos.x, pos.y);
+        loop {
+            let down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16 & 0x8000 != 0;
+            if !down {
+                break;
+            }
+            let mut c = POINT::default();
+            if unsafe { GetCursorPos(&mut c) }.is_err() {
+                break;
+            }
+            let x = pos.x + (c.x - start.x);
+            let y = pos.y + (c.y - start.y);
+            if x != lx || y != ly {
+                let _ = unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        None,
+                        x,
+                        y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                };
+                lx = x;
+                ly = y;
+            }
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        DRAGGING.store(false, Ordering::SeqCst);
+    });
+}
+
 #[tauri::command]
 fn expand_temporarily(app: tauri::AppHandle) {
+    MANUAL_ISLAND.store(false, Ordering::Relaxed);
     if let Ok(mut g) = EXPAND_UNTIL.lock() {
         *g = Some(std::time::Instant::now() + Duration::from_secs(8));
+    }
+    unsafe {
+        PIN_FG.store(
+            windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as isize,
+            Ordering::Relaxed,
+        );
     }
     if let Some(w) = app.get_webview_window("main") {
         apply_mode(&w, &app, UiMode::Expanded);
@@ -418,7 +595,13 @@ fn main() {
     let want_locked = cfg.locked.unwrap_or(false);
 
     let app = builder
-        .invoke_handler(tauri::generate_handler![app_ready, expand_temporarily])
+        .invoke_handler(tauri::generate_handler![
+            app_ready,
+            expand_temporarily,
+            collapse_to_island,
+            begin_drag,
+            island_hover
+        ])
         .setup(move |app| {
             let win = app.get_webview_window("main").expect("main window missing");
 
@@ -435,6 +618,15 @@ fn main() {
                 *g = Some(home);
             }
             let _ = win.set_position(tauri::PhysicalPosition::new(home.0, home.1));
+
+            if let (Ok(raw), Ok(size)) = (win.hwnd(), win.inner_size()) {
+                let (w, h) = if size.width > 0 && size.height > 0 {
+                    (size.width as i32, size.height as i32)
+                } else {
+                    card_size(&win)
+                };
+                anim::start(raw.0 as isize, anim::Rect::new(home.0, home.1, w, h));
+            }
 
             if want_locked {
                 LOCKED.store(true, Ordering::Relaxed);
@@ -544,7 +736,7 @@ fn main() {
                 let warmup = std::time::Instant::now();
                 let mut last_other = unsafe { GetForegroundWindow() };
                 loop {
-                    std::thread::sleep(Duration::from_millis(700));
+                    std::thread::sleep(Duration::from_millis(260));
                     if warmup.elapsed() < Duration::from_millis(1600) {
                         continue;
                     }
@@ -575,10 +767,17 @@ fn main() {
                         .and_then(|g| *g)
                         .map(|t| t > std::time::Instant::now())
                         .unwrap_or(false);
+                    let pinned_here = pinned
+                        && (desktop
+                            || (PIN_FG.load(Ordering::Relaxed) != 0
+                                && fg.0 as isize == PIN_FG.load(Ordering::Relaxed)));
 
+                    let manual_island = MANUAL_ISLAND.load(Ordering::Relaxed);
                     let want = if !desktop && fg_is_fullscreen(fg) {
                         UiMode::Hidden
-                    } else if desktop || pinned {
+                    } else if manual_island {
+                        UiMode::Island
+                    } else if desktop || pinned_here {
                         UiMode::Expanded
                     } else {
                         UiMode::Island
