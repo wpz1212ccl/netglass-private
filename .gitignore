@@ -1,0 +1,23 @@
+# Build output
+target/
+dist/
+src-tauri/gen/schemas/
+
+# Debug / scratch artifacts
+.scratch/
+.workbuddy/
+*.log
+*-log.txt
+
+# Screenshots, prototypes, demos
+prototype/
+*.mp4
+
+# Spikes kept local until folded into the app
+spike-s1/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
