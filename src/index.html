@@ -47,7 +47,6 @@
       border-radius .5s cubic-bezier(.6,0,.25,1),
       background .34s cubic-bezier(.6,0,.25,1),
       box-shadow .34s cubic-bezier(.6,0,.25,1);
-    will-change:transform,opacity;
   }
   .card::before{
     content:"";position:absolute;inset:0;pointer-events:none;
@@ -178,8 +177,14 @@
   .card.collapsed .inner{opacity:0;visibility:hidden;pointer-events:none;
         transition:opacity .14s ease,visibility 0s linear .14s,transform .3s cubic-bezier(.4,0,.6,1)}
   .card.collapsed .chart{opacity:0}
+  /* 状态呼吸灯：常态绿；加速器加速中变橙黄，SakuraCat 变红以区分。
+     2s 一个呼吸周期，颜色用 transition 平滑过渡，呼吸不中断。 */
   .mdot{width:6px;height:6px;border-radius:50%;background:#34C759;flex:none;
-        box-shadow:0 0 5px rgba(52,199,89,.35)}
+        box-shadow:0 0 5px rgba(52,199,89,.35);
+        will-change:transform,opacity;
+        transition:background-color .4s cubic-bezier(.6,0,.25,1),box-shadow .4s cubic-bezier(.6,0,.25,1)}
+  .mdot.acc{background:#FF9F0A;box-shadow:0 0 6px rgba(255,159,10,.5)}
+  .mdot.acc.cat{background:#FF3B30;box-shadow:0 0 6px rgba(255,59,48,.5)}
   #mDown{font-size:15px;font-weight:600;letter-spacing:-.02em;font-variant-numeric:tabular-nums;color:var(--ink)}
   #mUnit{font-size:10px;font-style:normal;color:rgba(18,21,26,.60)}
   .mup{font-size:10px;color:rgba(18,21,26,.55);font-variant-numeric:tabular-nums}
@@ -188,6 +193,7 @@
   /* 形变中：所有文字退场，只留下正在变化的圆角形状。
      !important 用于压过 .collapsed 的 visibility 规则，保证淡出可见。 */
   .card.morphing{transform:none!important;transition:none!important;contain:layout paint style;
+        will-change:transform,opacity;
         box-shadow:inset 0 0 0 .5px rgba(255,255,255,.55)!important;
         background:linear-gradient(180deg,rgba(255,255,255,.34),rgba(246,248,252,.24))!important}
   .card.morphing::before,.card.morphing::after{display:none!important}
@@ -202,6 +208,7 @@
      显示时移除 .out 淡入。展开态和胶囊共用同一套曲线。 */
   .card.out{
     opacity:0;transform:translateY(6px) scale(.962);
+    will-change:transform,opacity;
     transition:opacity .2s cubic-bezier(.6,0,.25,1),transform .32s cubic-bezier(.6,0,.25,1);
   }
   .card.collapsed.out{transform:translateY(3px) scale(.94)}
@@ -305,6 +312,8 @@
     mUp: document.getElementById('mUp'),
   };
 
+  const card = document.getElementById('card');
+
   class Spring {
     constructor(v) { this.x = v; this.v = 0; this.t = v; }
     step(dt) {
@@ -358,18 +367,17 @@
     return { d, a: `${d} L${W},${H} L0,${H} Z` };
   }
 
-  function paint() {
-    if (Math.max(...hist) < 1024) {
-      // 没有流量时不画蓝线，只留一条 0.6px 的发丝基线
-      el.area.setAttribute('d', '');
-      el.line.setAttribute('d', '');
-      el.base.setAttribute('opacity', '1');
-      return;
+  let lastArea = null, lastLine = null, lastBaseOp = null;
+  function paint(peak) {
+    // 差分：零流量/同形状时不重写 SVG 属性，省掉每秒一次的光栅失效
+    let a = '', d = '', bo = '1';
+    if (peak >= 1024) {
+      const p = build(hist);
+      a = p.a; d = p.d; bo = '0';
     }
-    el.base.setAttribute('opacity', '0');
-    const p = build(hist);
-    el.area.setAttribute('d', p.a);
-    el.line.setAttribute('d', p.d);
+    if (a !== lastArea) { el.area.setAttribute('d', a); lastArea = a; }
+    if (d !== lastLine) { el.line.setAttribute('d', d); lastLine = d; }
+    if (bo !== lastBaseOp) { el.base.setAttribute('opacity', bo); lastBaseOp = bo; }
   }
 
   let last = performance.now();
@@ -381,10 +389,11 @@
     const d = Math.max(0, sDown.x);
     const u = Math.max(0, sUp.x);
     const [dv, du] = fmt(d);
-    el.down.textContent = dv;
-    el.unit.textContent = du;
-    el.up.textContent = fmtPlain(u)[0];
-    el.upUnit.textContent = fmtPlain(u)[1];
+    setText(el.down, dv);
+    setText(el.unit, du);
+    const [uv, uu] = fmtPlain(u);
+    setText(el.up, uv);
+    setText(el.upUnit, uu);
   }
 
   function frame(now) {
@@ -425,27 +434,91 @@
   let lockedNow = false;
   let connText = '已连接';
   let lastSample = null;
+  let lastProbe = null;
+  const mdot = document.querySelector('.mdot');
+
+  // 呼吸灯改 JS 驱动 ≤15fps：120Hz 合成器不再被无限动画永久唤醒。
+  // DC 静态点（三态色保留）、展开/隐藏/形变期间暂停；颜色仍走 transition。
+  let batteryNow = false;
+  let hiddenNow = false;
+  let morphNow = false;
+  let breatheTimer = null;
+  let breatheT0 = 0;
+  function breatheTick() {
+    const t = ((performance.now() - breatheT0) % 2000) / 2000;
+    const s = 0.5 - 0.5 * Math.cos(t * Math.PI * 2);
+    mdot.style.opacity = (1 - 0.45 * s).toFixed(3);
+    mdot.style.transform = 'scale(' + (1 - 0.2 * s).toFixed(3) + ')';
+  }
+  function updateBreathe() {
+    const want = isCollapsed() && !batteryNow && !hiddenNow && !morphNow;
+    if (want && breatheTimer === null) {
+      breatheT0 = performance.now();
+      breatheTick();
+      breatheTimer = setInterval(breatheTick, 66);
+    } else if (!want && breatheTimer !== null) {
+      clearInterval(breatheTimer);
+      breatheTimer = null;
+      mdot.style.opacity = '';
+      mdot.style.transform = '';
+    }
+  }
+
+  function setText(node, v) {
+    if (node.textContent !== v) node.textContent = v;
+  }
+
+  function isCollapsed() { return card.classList.contains('collapsed'); }
+
+  // 卡片正文（标题/底栏/详情/曲线）只在展开态可见；
+  // 胶囊态每秒改这些节点，只会让 Chromium 重排一轮看不见的内容。
+  function renderCard(s, primary) {
+    setText(el.title, primary ? primary.alias : '无网络');
+    connText = primary ? '已连接' : '无网络';
+    setText(el.state, lockedNow ? connText + ' · 已锁定' : connText);
+
+    const wifi = s.ifaces.find(i => i.kind === 'wifi');
+    if (!wifi) {
+      setText(el.wifi, '无');
+      if (el.wifi.className !== 'off') el.wifi.className = 'off';
+    } else if (wifi.state === 'up') {
+      setText(el.wifi, '已连接');
+      if (el.wifi.className !== '') el.wifi.className = '';
+    } else {
+      setText(el.wifi, '未连接');
+      if (el.wifi.className !== 'off') el.wifi.className = 'off';
+    }
+
+    const peak = Math.max(...hist);
+    const peakUp = Math.max(...upHist);
+    setText(el.peak, fmtPlain(peak)[0] + ' ' + fmtPlain(peak)[1]);
+    setText(el.peakUp, fmtPlain(peakUp)[0] + ' ' + fmtPlain(peakUp)[1]);
+    setText(el.link, primary && primary.link_mbps ? primary.link_mbps.toFixed(0) + ' Mbps' : '—');
+    paint(peak);
+  }
 
   function onSample(s) {
     lastSample = s;
     primaryId = s.primary_id;
     const primary = s.ifaces.find(i => i.id === s.primary_id);
-    el.title.textContent = primary ? primary.alias : '无网络';
-    connText = primary ? '已连接' : '无网络';
-    el.state.textContent = lockedNow ? connText + ' · 已锁定' : connText;
-
-    const wifi = s.ifaces.find(i => i.kind === 'wifi');
-    if (!wifi) { el.wifi.textContent = '无'; el.wifi.className = 'off'; }
-    else if (wifi.state === 'up') { el.wifi.textContent = '已连接'; el.wifi.className = ''; }
-    else { el.wifi.textContent = '未连接'; el.wifi.className = 'off'; }
 
     hist.push(s.total_down); hist.shift();
     upHist.push(s.total_up); upHist.shift();
-    paint();
 
     const changed = Math.abs(s.total_down - sDown.t) > Math.max(1024, sDown.t * 0.01);
     sDown.t = s.total_down;
     sUp.t = s.total_up;
+
+    if (isCollapsed()) {
+      // 胶囊态只更新可见的迷你数字；卡片内文与曲线等展开时补一次
+      sDown.x = sDown.t;
+      sUp.x = sUp.t;
+      setText(el.mDown, fmtPlain(s.total_down)[0]);
+      setText(el.mUnit, fmtPlain(s.total_down)[1]);
+      setText(el.mUp, fmtPlain(s.total_up)[0] + ' ' + fmtPlain(s.total_up)[1]);
+      return;
+    }
+
     if (changed) {
       kick();
     } else {
@@ -454,13 +527,10 @@
       renderValues();
     }
 
-    el.mDown.textContent = fmtPlain(s.total_down)[0];
-    el.mUnit.textContent = fmtPlain(s.total_down)[1];
-    el.mUp.textContent = fmtPlain(s.total_up)[0] + ' ' + fmtPlain(s.total_up)[1];
-
-    el.peak.textContent = fmtPlain(Math.max(...hist))[0] + ' ' + fmtPlain(Math.max(...hist))[1];
-    el.peakUp.textContent = fmtPlain(Math.max(...upHist))[0] + ' ' + fmtPlain(Math.max(...upHist))[1];
-    el.link.textContent = primary && primary.link_mbps ? primary.link_mbps.toFixed(0) + ' Mbps' : '—';
+    setText(el.mDown, fmtPlain(s.total_down)[0]);
+    setText(el.mUnit, fmtPlain(s.total_down)[1]);
+    setText(el.mUp, fmtPlain(s.total_up)[0] + ' ' + fmtPlain(s.total_up)[1]);
+    renderCard(s, primary);
   }
 
   document.querySelector('.mini').addEventListener('click', () => {
@@ -468,31 +538,44 @@
   });
 
   function onProbe(p) {
+    lastProbe = p;
+    // 呼吸灯在胶囊（灵动岛）态也可见，必须先于展开态分支更新；
+    // "在运行"≠"在加速"，加速判定由后端给出（hosts 块或自有监听端口）
+    const acc = (p.proxy && p.proxy.accelerating && p.proxy.accelerating[0]) || null;
+    mdot.classList.toggle('acc', !!acc);
+    mdot.classList.toggle('cat', acc === 'SakuraCat');
+    batteryNow = !!p.battery;
+    updateBreathe();
+
+    if (isCollapsed()) return; // 胶囊态看不到代理/延迟，展开时用 lastProbe 补
     const via = p.via;
     let text, cls;
-    if (via && via.ok) { text = Math.round(via.ms) + ' ms'; cls = ''; }
+    if (acc) { text = acc + ' 加速中'; cls = ''; }
+    else if (via && via.ok) { text = Math.round(via.ms) + ' ms'; cls = ''; }
+    else if (p.direct && p.direct.error === 'paused') { text = '暂停'; cls = 'warn'; }
     else if (p.proxy && p.proxy.port) { text = '不通'; cls = 'err'; }
     else if (p.proxy && p.proxy.accelerators && p.proxy.accelerators.length) {
       text = p.proxy.accelerators[0] + ' 未加速'; cls = '';
     } else { text = '未启用'; cls = 'warn'; }
 
-    el.proxy.textContent = text;
-    el.proxy.className = cls;
+    setText(el.proxy, text);
+    if (el.proxy.className !== cls) el.proxy.className = cls;
 
-    const detail = (via && via.ok)
-      ? text
+    const detail = acc ? '加速中'
+      : (via && via.ok) ? text
+      : (p.direct && p.direct.error === 'paused') ? '暂停'
       : (p.proxy && p.proxy.port) ? '不通'
       : (p.proxy && p.proxy.accelerators && p.proxy.accelerators.length) ? '未加速'
       : '未启用';
-    el.proxy2.textContent = detail;
-    el.proxy2.style.color = cls === 'err' ? '#FF3B30' : cls === 'warn' ? '#C46A00' : 'var(--s2)';
+    setText(el.proxy2, detail);
+    const col = cls === 'err' ? '#FF3B30' : cls === 'warn' ? '#C46A00' : 'var(--s2)';
+    if (el.proxy2.style.color !== col) el.proxy2.style.color = col;
 
-    if (p.direct && p.direct.ok) el.latency.textContent = Math.round(p.direct.ms) + ' ms';
-    else el.latency.textContent = '—';
+    if (p.direct && p.direct.ok) setText(el.latency, Math.round(p.direct.ms) + ' ms');
+    else setText(el.latency, '—');
   }
 
   if (window.__TAURI__) {
-    const card = document.getElementById('card');
     // 首帧就保持透明，等 app_ready 后的 net-mode 再淡入，避免冷启动硬闪
     card.classList.add('out');
     const enter = () => requestAnimationFrame(() => requestAnimationFrame(() => card.classList.remove('out')));
@@ -526,12 +609,16 @@
     window.__TAURI__.event.listen('net-leave', () => {
       card.classList.remove('hot');
       card.classList.add('out');
+      hiddenNow = true;
+      updateBreathe();
     });
     // 形变开始：切换目标布局、隐藏所有文字，窗口矩形交给 Rust 弹簧
     window.__TAURI__.event.listen('net-morph', e => {
       const toIsland = e.payload === 'island';
       card.classList.toggle('collapsed', toIsland);
       card.classList.add('morphing');
+      morphNow = true;
+      updateBreathe();
       if (!toIsland) {
         card.classList.remove('hot');
         window.__TAURI__.core.invoke('island_hover', { hot: false });
@@ -542,12 +629,23 @@
       const toIsland = e.payload === 'island';
       card.classList.toggle('collapsed', toIsland);
       card.classList.remove('morphing');
+      hiddenNow = false;
+      morphNow = false;
+      updateBreathe();
       // 窗口是被移动到鼠标下方的：Chromium 会误判为 hover，
       // 先冻结 hover 样式，等鼠标真的动了再恢复。
       if (!toIsland) {
         card.classList.remove('hot');
         card.classList.add('nohover');
         window.addEventListener('pointermove', () => card.classList.remove('nohover'), { once: true });
+        // 胶囊态跳过了卡片内文/曲线/探针的 DOM 更新：展开时按最近一帧补齐
+        sDown.x = sDown.t;
+        sUp.x = sUp.t;
+        renderValues();
+        if (lastSample) {
+          renderCard(lastSample, lastSample.ifaces.find(i => i.id === lastSample.primary_id));
+        }
+        if (lastProbe) onProbe(lastProbe);
       }
       enter();
     });
@@ -568,7 +666,6 @@
     el.peak.textContent = '—';
     el.peakUp.textContent = '—';
     el.link.textContent = '—';
-    el.count.textContent = '—';
   }
 })();
 </script>

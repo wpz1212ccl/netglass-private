@@ -21,7 +21,8 @@
         "resizable": false,
         "shadow": false,
         "visible": false,
-        "center": true
+        "center": true,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,msFloatyMode --enable-features=msWebView2TreatAppSuspendAsDeviceSuspend,msWebView2SimulateMemoryPressureWhenInactive"
       }
     ],
     "security": {

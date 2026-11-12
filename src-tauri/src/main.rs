@@ -6,7 +6,7 @@ mod probe;
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -104,6 +104,82 @@ fn mode_str(mode: UiMode) -> &'static str {
     }
 }
 
+/// 前台窗口类别。任务栏、Alt+Tab 覆盖层、托盘溢出面板是 Shell 的临时 UI：
+/// 它们会短暂抢走前台，但不代表用户离开了桌面或切换了页面。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FgKind {
+    Desktop,
+    ShellTransient,
+    App,
+}
+
+fn classify_fg(class: &str) -> FgKind {
+    match class {
+        "Progman" | "WorkerW" => FgKind::Desktop,
+        "Shell_TrayWnd"
+        | "NotifyIconOverflowWindow"
+        | "TopLevelWindowForOverflowXamlIsland"
+        | "XamlExplorerHostIslandWindow"
+        | "Windows.UI.Core.CoreWindow"
+        | "TaskSwitcherWnd"
+        | "MultitaskingViewFrame" => FgKind::ShellTransient,
+        _ => FgKind::App,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FgSnapshot {
+    kind: FgKind,
+    fullscreen: bool,
+    manual_island: bool,
+    pinned_here: bool,
+    already_expanded: bool,
+}
+
+/// 桌面连续在前台多久才自动展开。短于这个值的前台变化（点任务栏、
+/// Alt+Tab、最小化动画）都会让计时作废，避免胶囊与卡片来回抽动。
+const DESKTOP_SETTLE: Duration = Duration::from_secs(2);
+
+/// 前台窗口 → 形态的纯决策状态机。时间由调用方注入，便于按 260ms 轮询节奏单测。
+struct ModeGate {
+    desktop_since: Option<Instant>,
+}
+
+impl ModeGate {
+    fn new() -> Self {
+        Self {
+            desktop_since: None,
+        }
+    }
+
+    fn decide(&mut self, now: Instant, s: FgSnapshot) -> UiMode {
+        match s.kind {
+            FgKind::Desktop => {
+                self.desktop_since.get_or_insert(now);
+            }
+            // 任务栏/Alt+Tab 覆盖层只是路过，既不算离开桌面，也不启动计时
+            FgKind::ShellTransient => {}
+            FgKind::App => self.desktop_since = None,
+        }
+        if s.kind == FgKind::App && s.fullscreen {
+            return UiMode::Hidden;
+        }
+        if s.manual_island {
+            return UiMode::Island;
+        }
+        let desktop_stable = self
+            .desktop_since
+            .is_some_and(|t| now.duration_since(t) >= DESKTOP_SETTLE);
+        // 2 秒门槛只约束"胶囊→卡片"；已经展开的卡片在桌面上不必先收回再展开
+        // （冷启动首帧就是这样）。
+        if desktop_stable || s.pinned_here || (s.kind == FgKind::Desktop && s.already_expanded) {
+            UiMode::Expanded
+        } else {
+            UiMode::Island
+        }
+    }
+}
+
 /// 实际显示形态。三态切换要加淡出动画，必须知道"现在是不是已经在这个形态"，
 /// 否则模式轮询会在展开 700ms 后再补一次 hide/show，把动画打成两段。
 static MODE: AtomicU8 = AtomicU8::new(0);
@@ -143,11 +219,94 @@ fn card_rect(win: &tauri::WebviewWindow) -> anim::Rect {
     anim::Rect::new(x, y, w, h)
 }
 
+/// 灵动岛挂载点。默认顶部居中；前台窗口压住这个位置时躲到它没盖住的一侧。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IslandAnchor {
+    Center,
+    Left,
+    Right,
+}
+
+static ISLAND_ANCHOR: AtomicU8 = AtomicU8::new(0);
+
+fn anchor_code(anchor: IslandAnchor) -> u8 {
+    match anchor {
+        IslandAnchor::Center => 0,
+        IslandAnchor::Left => 1,
+        IslandAnchor::Right => 2,
+    }
+}
+
+fn island_anchor() -> IslandAnchor {
+    match ISLAND_ANCHOR.load(Ordering::Relaxed) {
+        1 => IslandAnchor::Left,
+        2 => IslandAnchor::Right,
+        _ => IslandAnchor::Center,
+    }
+}
+
+fn screen_rect() -> anim::Rect {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+    };
+    unsafe {
+        anim::Rect::new(
+            0,
+            0,
+            GetSystemMetrics(SM_CXSCREEN),
+            GetSystemMetrics(SM_CYSCREEN),
+        )
+    }
+}
+
+/// 默认挂载位置（顶部居中、基础尺寸）。只用来判断"这个位置有没有被压住"，
+/// 不受悬浮放大和当前躲让位置影响。
+fn island_center_rect(win: &tauri::WebviewWindow) -> anim::Rect {
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let sw = screen_rect().w;
+    let w = (ISLAND_W * scale).round() as i32;
+    let h = (ISLAND_H * scale).round() as i32;
+    anim::Rect::new((sw - w) / 2, 0, w, h)
+}
+
+/// 前台窗口矩形与"顶部居中"相交时选一个角落：
+/// 哪侧没被窗口覆盖就躲哪侧；两侧都塞不下时躲空间大的那边，
+/// 完全贴满（最大化）则躲左上——右上永远是窗口的最小化/关闭按钮。
+fn pick_anchor(
+    window: Option<anim::Rect>,
+    island: anim::Rect,
+    screen: anim::Rect,
+) -> IslandAnchor {
+    let Some(window) = window else {
+        return IslandAnchor::Center;
+    };
+    let right = window.x + window.w;
+    let bottom = window.y + window.h;
+    let overlaps = window.x < island.x + island.w
+        && right > island.x
+        && window.y < island.y + island.h
+        && bottom > island.y;
+    if !overlaps {
+        return IslandAnchor::Center;
+    }
+    let screen_right = screen.x + screen.w;
+    let free_left = window.x.clamp(screen.x, screen_right) - screen.x;
+    let free_right = screen_right - right.clamp(screen.x, screen_right);
+    let fits_left = free_left >= island.w;
+    let fits_right = free_right >= island.w;
+    match (fits_left, fits_right) {
+        (true, false) => IslandAnchor::Left,
+        (false, true) => IslandAnchor::Right,
+        (true, true) if free_right > free_left => IslandAnchor::Right,
+        (true, true) => IslandAnchor::Left,
+        (false, false) if free_right > free_left => IslandAnchor::Right,
+        (false, false) => IslandAnchor::Left,
+    }
+}
+
 fn island_rect(win: &tauri::WebviewWindow, hot: bool) -> anim::Rect {
     let scale = win.scale_factor().unwrap_or(1.0);
-    let sw = unsafe { windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-        windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN,
-    ) };
+    let sw = screen_rect().w;
     let (lw, lh) = if hot {
         (ISLAND_HOT_W, ISLAND_HOT_H)
     } else {
@@ -155,7 +314,13 @@ fn island_rect(win: &tauri::WebviewWindow, hot: bool) -> anim::Rect {
     };
     let w = (lw * scale).round() as i32;
     let h = (lh * scale).round() as i32;
-    anim::Rect::new((sw - w) / 2, 0, w, h)
+    let edge = (8.0 * scale).round() as i32;
+    let x = match island_anchor() {
+        IslandAnchor::Center => (sw - w) / 2,
+        IslandAnchor::Left => edge,
+        IslandAnchor::Right => sw - w - edge,
+    };
+    anim::Rect::new(x, 0, w, h)
 }
 
 fn target_rect(win: &tauri::WebviewWindow, mode: UiMode) -> Option<anim::Rect> {
@@ -167,6 +332,9 @@ fn target_rect(win: &tauri::WebviewWindow, mode: UiMode) -> Option<anim::Rect> {
 }
 
 const HOVER_MOTION: anim::Motion = anim::Motion::new(0.30, 0.55);
+
+/// 躲到屏幕角落：大位移纯平移。阻尼取高值，回弹再好看也不能冲出屏幕边缘。
+const DODGE_MOTION: anim::Motion = anim::Motion::new(0.34, 0.92);
 
 /// 展开：略软、带回弹（damping < 1）；收回：更快、几乎不过冲。
 fn motion_for(mode: UiMode) -> anim::Motion {
@@ -273,6 +441,7 @@ fn apply_mode(win: &tauri::WebviewWindow, app: &tauri::AppHandle, mode: UiMode) 
             ISLAND_HOT.store(false, Ordering::Relaxed);
             fade_out(win, app);
             let _ = win.hide();
+            set_webview_active(app, false);
         }
         UiMode::Expanded | UiMode::Island => {
             if mode != UiMode::Island {
@@ -289,6 +458,7 @@ fn apply_mode(win: &tauri::WebviewWindow, app: &tauri::AppHandle, mode: UiMode) 
                 let _ = win.set_size(LogicalSize::new(lw, lh));
                 let _ = win.set_position(PhysicalPosition::new(target.x, target.y));
                 anim::snap_to(target);
+                set_webview_active(app, true);
                 let _ = win.show();
                 tune_window(win);
                 let _ = app.emit("net-mode", mode_str(mode));
@@ -341,6 +511,32 @@ fn fg_is_fullscreen(fg: windows::Win32::Foundation::HWND) -> bool {
     }
 }
 
+/// 前台窗口矩形（物理像素）。最小化窗口的坐标是 -32000，阴影/辅助窗口
+/// 可能整块离屏或只有几十像素宽——这些都不能代表用户正在看的界面，返回 None。
+fn fg_window_rect(fg: windows::Win32::Foundation::HWND) -> Option<anim::Rect> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic};
+    if unsafe { IsIconic(fg) }.as_bool() {
+        return None;
+    }
+    let mut r = RECT::default();
+    unsafe { GetWindowRect(fg, &mut r).ok()? };
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
+    if w < 200 || h < 120 {
+        return None;
+    }
+    let screen = screen_rect();
+    let on_screen = r.right > screen.x
+        && r.left < screen.x + screen.w
+        && r.bottom > screen.y
+        && r.top < screen.y + screen.h;
+    if !on_screen {
+        return None;
+    }
+    Some(anim::Rect::new(r.left, r.top, w, h))
+}
+
 fn toggle_lock(app: &tauri::AppHandle) {
     let next = !LOCKED.load(Ordering::Relaxed);
     LOCKED.store(next, Ordering::Relaxed);
@@ -351,6 +547,38 @@ fn toggle_lock(app: &tauri::AppHandle) {
 }
 
 
+
+/// 采样/探针线程共用：窗口不可见时前端没有渲染的必要。
+fn window_visible(app: &tauri::AppHandle) -> bool {
+    app.get_webview_window("main")
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false)
+}
+
+/// 隐藏时同步 WebView2 IsVisible 并 TrySuspend：Tauri 的 hide() 只做 SW_HIDE，
+/// controller 的 IsVisible 恒 TRUE，渲染管线会一直空转（MS 官方要求隐藏时关）。
+/// 显示时先 Resume 再可见，避免恢复首帧空板。
+fn set_webview_active(app: &tauri::AppHandle, active: bool) {
+    let Some(w) = app.get_webview_window("main") else { return };
+    let _ = w.with_webview(move |pv| unsafe {
+        use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_3;
+        use windows::core::Interface;
+        let _ = pv.controller().SetIsVisible(active);
+        let Ok(wv) = pv.controller().CoreWebView2() else { return };
+        let Ok(wv3) = wv.cast::<ICoreWebView2_3>() else { return };
+        if active {
+            let mut suspended = windows::core::BOOL::default();
+            if wv3.IsSuspended(&mut suspended).is_ok() && suspended.as_bool() {
+                let _ = wv3.Resume();
+            }
+        } else {
+            let handler = webview2_com::TrySuspendCompletedHandler::create(Box::new(
+                |_r: windows::core::Result<()>, _s: bool| Ok(()),
+            ));
+            let _ = wv3.TrySuspend(&handler);
+        }
+    });
+}
 
 fn toggle_visible(app: &tauri::AppHandle) {
     use tauri::{LogicalSize, PhysicalPosition};
@@ -365,6 +593,7 @@ fn toggle_visible(app: &tauri::AppHandle) {
                 std::thread::sleep(Duration::from_millis(220));
                 if let Some(w) = h.get_webview_window("main") {
                     let _ = w.hide();
+                    set_webview_active(&h, false);
                 }
             });
         } else {
@@ -381,6 +610,7 @@ fn toggle_visible(app: &tauri::AppHandle) {
                 let _ = w.set_position(PhysicalPosition::new(target.x, target.y));
                 anim::snap_to(target);
             }
+            set_webview_active(app, true);
             let _ = w.show();
             tune_window(&w);
             let _ = app.emit("net-mode", mode_str(mode));
@@ -396,6 +626,10 @@ fn log_line(s: &str) {
         .append(true)
         .open(p)
     {
+        // 常驻进程无界追加会慢慢长大；超 256KB 清空重来
+        if f.metadata().map(|m| m.len() > 256 * 1024).unwrap_or(false) {
+            let _ = f.set_len(0);
+        }
         let _ = writeln!(f, "{s}");
     }
 }
@@ -636,6 +870,7 @@ fn main() {
             }
 
             tune_window(&win);
+            #[cfg(debug_assertions)]
             netmon::dump();
 
             // Ctrl+Alt+L 可能被别的程序占用，按候选顺序取第一个能注册的
@@ -735,6 +970,7 @@ fn main() {
                 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
                 let warmup = std::time::Instant::now();
                 let mut last_other = unsafe { GetForegroundWindow() };
+                let mut gate = ModeGate::new();
                 loop {
                     std::thread::sleep(Duration::from_millis(260));
                     if warmup.elapsed() < Duration::from_millis(1600) {
@@ -757,10 +993,7 @@ fn main() {
                         last_other = fg;
                     }
 
-                    let desktop = matches!(
-                        class.as_str(),
-                        "Progman" | "WorkerW" | "Shell_TrayWnd" | "NotifyIconOverflowWindow"
-                    );
+                    let kind = classify_fg(&class);
                     let pinned = EXPAND_UNTIL
                         .lock()
                         .ok()
@@ -768,24 +1001,51 @@ fn main() {
                         .map(|t| t > std::time::Instant::now())
                         .unwrap_or(false);
                     let pinned_here = pinned
-                        && (desktop
+                        && (kind != FgKind::App
                             || (PIN_FG.load(Ordering::Relaxed) != 0
                                 && fg.0 as isize == PIN_FG.load(Ordering::Relaxed)));
-
-                    let manual_island = MANUAL_ISLAND.load(Ordering::Relaxed);
-                    let want = if !desktop && fg_is_fullscreen(fg) {
-                        UiMode::Hidden
-                    } else if manual_island {
-                        UiMode::Island
-                    } else if desktop || pinned_here {
-                        UiMode::Expanded
-                    } else {
-                        UiMode::Island
-                    };
 
                     // MODE 由 apply_mode 维护，expand_temporarily 也会改，
                     // 用共享状态判断才不会在展开后再补一次切换动画。
                     let current = mode_from_code(MODE.load(Ordering::Relaxed));
+
+                    // 前台窗口压住顶部居中时躲到没被覆盖的一角；只是平移窗口，
+                    // 不换内容。任务栏/Alt+Tab 覆盖层保持当前挂载点，避免来回跳。
+                    let next_anchor = if kind == FgKind::App {
+                        match fg_window_rect(fg) {
+                            Some(rect) => {
+                                pick_anchor(Some(rect), island_center_rect(&w), screen_rect())
+                            }
+                            // 阴影/离屏辅助窗口拿不到可信矩形：保持当前挂载点，
+                            // 不要被它拽回中间再弹出去
+                            None => island_anchor(),
+                        }
+                    } else if kind == FgKind::Desktop {
+                        IslandAnchor::Center
+                    } else {
+                        island_anchor()
+                    };
+                    if next_anchor != island_anchor() {
+                        ISLAND_ANCHOR.store(anchor_code(next_anchor), Ordering::Relaxed);
+                        log_line(&format!("anchor {:?} fg={class}", next_anchor));
+                        if current == UiMode::Island && w.is_visible().unwrap_or(false) {
+                            anim::animate_to(
+                                island_rect(&w, ISLAND_HOT.load(Ordering::Relaxed)),
+                                DODGE_MOTION,
+                            );
+                        }
+                    }
+
+                    let want = gate.decide(
+                        std::time::Instant::now(),
+                        FgSnapshot {
+                            kind,
+                            fullscreen: kind == FgKind::App && fg_is_fullscreen(fg),
+                            manual_island: MANUAL_ISLAND.load(Ordering::Relaxed),
+                            pinned_here,
+                            already_expanded: current == UiMode::Expanded,
+                        },
+                    );
                     if want != current {
                         if current == UiMode::Expanded {
                             remember_expanded_pos(&w);
@@ -802,31 +1062,87 @@ fn main() {
                 std::thread::sleep(Duration::from_secs(3));
                 if let Some(w) = fb.get_webview_window("main") {
                     if !w.is_visible().unwrap_or(false) {
+                        set_webview_active(&fb, true);
                         let _ = w.show();
+                        // 与 app_ready 路径对齐：补 exstyle 与内容形态
+                        tune_window(&w);
+                        let _ = fb.emit("net-mode", mode_str(mode_from_code(MODE.load(Ordering::Relaxed))));
                     }
                 }
             });
 
-            // 采样线程
-            let handle = app.handle().clone();            std::thread::spawn(move || {
+            // 采样线程。窗口隐藏（托盘隐藏 / 全屏应用）时前端根本不画，
+            // 照样每秒跨进程序列化整份 Sample 只会白烧 WebView 的 CPU；
+            // 采样本身保留，计数差分与隐藏前的基线不断档。
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
                 let mut sampler = netmon::Sampler::new();
-                sampler.sample();
+                sampler.sample(true);
                 std::thread::sleep(Duration::from_millis(1000));
                 loop {
-                    let s = sampler.sample();
-                    let _ = handle.emit("net-sample", &s);
+                    let vis = window_visible(&handle);
+                    let s = sampler.sample(vis);
+                    if vis {
+                        let _ = handle.emit("net-sample", &s);
+                    }
                     std::thread::sleep(Duration::from_millis(1000));
                 }
             });
 
-            // 探针线程
+            // 探针线程，两种节奏：
+            //   本地状态（代理端口/加速器/加速中）2s 一刷——全是本机调用、零外网开销，
+            //     开/停代理、切换网络 ≤3s 反映到呼吸灯和状态行；
+            //   外网时延（直连握手）10s 一轮，电池下不做，避免把网卡从省电态拉起。
+            // 经代理的 CONNECT 探测只在端口出现/更换或外网轮次时重测，
+            // 不让本地代理每 2s 替我们连一次 github。
+            // 隐藏时不做任何探测，重新显示后立即补上。
             let probe_handle = app.handle().clone();
             std::thread::spawn(move || {
+                let mut cached: Option<probe::ProbePayload> = None;
+                let mut last_local: Option<Instant> = None;
+                let mut last_external: Option<Instant> = None;
+                let mut last_port: Option<u16> = None;
                 std::thread::sleep(Duration::from_secs(3));
                 loop {
-                    let p = probe::run_probe();
-                    let _ = probe_handle.emit("net-probe", &p);
-                    std::thread::sleep(Duration::from_secs(30));
+                    let visible = window_visible(&probe_handle);
+                    let local_due = last_local
+                        .map(|t| t.elapsed() >= Duration::from_secs(2))
+                        .unwrap_or(true);
+                    if visible && local_due {
+                        let battery = probe::on_battery();
+                        let external_due = !battery
+                            && last_external
+                                .map(|t| t.elapsed() >= Duration::from_secs(10))
+                                .unwrap_or(true);
+                        let p = if external_due {
+                            let p = probe::run_probe();
+                            cached = Some(p.clone());
+                            last_external = Some(Instant::now());
+                            p
+                        } else {
+                            let mut p = match &cached {
+                                Some(c) => {
+                                    let mut p2 = c.clone();
+                                    p2.proxy = probe::proxy_state();
+                                    p2
+                                }
+                                None => probe::offline_payload(),
+                            };
+                            if p.proxy.port != last_port {
+                                p.via = p
+                                    .proxy
+                                    .port
+                                    .map(|port| probe::http_connect_probe(port, "github.com", 443, 5000));
+                            }
+                            p
+                        };
+                        let mut p = p;
+                        p.battery = battery;
+                        last_port = p.proxy.port;
+                        let _ = probe_handle.emit("net-probe", &p);
+                        last_local = Some(Instant::now());
+                    }
+                    std::thread::sleep(Duration::from_secs(if visible { 1 } else { 2 }));
                 }
             });
 
@@ -843,4 +1159,290 @@ fn main() {
             save_config();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 前台轮询的真实节奏
+    const TICK: Duration = Duration::from_millis(260);
+
+    fn snap(kind: FgKind) -> FgSnapshot {
+        FgSnapshot {
+            kind,
+            fullscreen: false,
+            manual_island: false,
+            pinned_here: false,
+            already_expanded: false,
+        }
+    }
+
+    fn run(gate: &mut ModeGate, t0: Instant, classes: &[&str]) -> Vec<UiMode> {
+        classes
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                gate.decide(
+                    t0 + TICK * i as u32,
+                    FgSnapshot {
+                        already_expanded: false,
+                        ..snap(classify_fg(c))
+                    },
+                )
+            })
+            .collect()
+    }
+
+    // 复现日志里的真实序列：点击任务栏图标 / Alt+Tab 时，
+    // Shell_TrayWnd、Alt+Tab 覆盖层会短暂出现在前台。
+    #[test]
+    fn taskbar_click_and_alt_tab_never_expand() {
+        let t0 = Instant::now();
+        let mut g = ModeGate::new();
+        let modes = run(
+            &mut g,
+            t0,
+            &[
+                "Chrome_WidgetWin_1",
+                "Chrome_WidgetWin_1",
+                "Shell_TrayWnd",
+                "Chrome_WidgetWin_1",
+                "XamlExplorerHostIslandWindow",
+                "Chrome_WidgetWin_1",
+            ],
+        );
+        assert!(
+            modes.iter().all(|m| *m == UiMode::Island),
+            "灵动岛不应在切换页面时展开成卡片：{modes:?}"
+        );
+    }
+
+    #[test]
+    fn taskbar_focus_for_seconds_never_expands() {
+        let t0 = Instant::now();
+        let mut g = ModeGate::new();
+        let modes = run(&mut g, t0, &["Shell_TrayWnd"; 20]);
+        assert!(modes.iter().all(|m| *m == UiMode::Island), "{modes:?}");
+    }
+
+    #[test]
+    fn taskbar_is_not_desktop() {
+        assert_eq!(classify_fg("Shell_TrayWnd"), FgKind::ShellTransient);
+        assert_eq!(classify_fg("Progman"), FgKind::Desktop);
+        assert_eq!(classify_fg("Chrome_WidgetWin_1"), FgKind::App);
+    }
+
+    #[test]
+    fn alt_tab_overlay_is_not_a_fullscreen_app() {
+        let mut g = ModeGate::new();
+        let m = g.decide(
+            Instant::now(),
+            FgSnapshot {
+                kind: classify_fg("XamlExplorerHostIslandWindow"),
+                fullscreen: true,
+                ..snap(FgKind::App)
+            },
+        );
+        assert_ne!(m, UiMode::Hidden, "Alt+Tab 覆盖层不应让胶囊消失");
+    }
+
+    #[test]
+    fn desktop_must_settle_two_seconds() {
+        let t0 = Instant::now();
+        let mut g = ModeGate::new();
+        let modes = run(&mut g, t0, &["Progman"; 9]);
+        assert!(
+            modes[..8].iter().all(|m| *m == UiMode::Island),
+            "桌面不足 2 秒不应展开：{modes:?}"
+        );
+        assert_eq!(modes[8], UiMode::Expanded, "桌面持续 2 秒后才展开");
+    }
+
+    #[test]
+    fn desktop_interrupted_resets_timer() {
+        let t0 = Instant::now();
+        let mut g = ModeGate::new();
+        let modes = run(
+            &mut g,
+            t0,
+            &[
+                "Progman",
+                "Progman",
+                "Progman",
+                "Chrome_WidgetWin_1",
+                "Progman",
+                "Progman",
+                "Progman",
+                "Progman",
+                "Progman",
+                "Progman",
+                "Progman",
+                "Progman",
+                "Progman",
+            ],
+        );
+        assert!(
+            modes[..12].iter().all(|m| *m == UiMode::Island),
+            "中途切到应用后必须重新计时：{modes:?}"
+        );
+        assert_eq!(modes[12], UiMode::Expanded);
+    }
+
+    #[test]
+    fn shell_transient_keeps_expanded_desktop() {
+        let t0 = Instant::now();
+        let mut g = ModeGate::new();
+        let modes = run(
+            &mut g,
+            t0,
+            &[
+                "Progman",
+                "Progman",
+                "Progman",
+                "Progman",
+                "Progman",
+                "Progman",
+                "Progman",
+                "Progman",
+                "Progman",
+                "Shell_TrayWnd",
+                "XamlExplorerHostIslandWindow",
+                "Chrome_WidgetWin_1",
+            ],
+        );
+        assert_eq!(modes[8], UiMode::Expanded);
+        assert_eq!(modes[9], UiMode::Expanded, "点任务栏不应把卡片打回胶囊");
+        assert_eq!(modes[10], UiMode::Expanded);
+        assert_eq!(modes[11], UiMode::Island, "切到真实应用才收回");
+    }
+
+    #[test]
+    fn manual_expand_is_immediate() {
+        let mut g = ModeGate::new();
+        let m = g.decide(
+            Instant::now(),
+            FgSnapshot {
+                pinned_here: true,
+                ..snap(FgKind::App)
+            },
+        );
+        assert_eq!(m, UiMode::Expanded, "点击灵动岛必须立即展开");
+    }
+
+    #[test]
+    fn manual_collapse_survives_desktop() {
+        let t0 = Instant::now();
+        let mut g = ModeGate::new();
+        for i in 0..20 {
+            let m = g.decide(
+                t0 + TICK * i,
+                FgSnapshot {
+                    manual_island: true,
+                    ..snap(FgKind::Desktop)
+                },
+            );
+            assert_eq!(m, UiMode::Island, "双击收回后不应被桌面抢回去");
+        }
+    }
+
+    #[test]
+    fn startup_expanded_on_desktop_stays_expanded() {
+        let t0 = Instant::now();
+        let mut g = ModeGate::new();
+        for i in 0..8 {
+            let m = g.decide(
+                t0 + TICK * i,
+                FgSnapshot {
+                    already_expanded: true,
+                    ..snap(FgKind::Desktop)
+                },
+            );
+            assert_eq!(m, UiMode::Expanded, "冷启动已展开时不应先收回再弹出");
+        }
+    }
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> anim::Rect {
+        anim::Rect::new(x, y, w, h)
+    }
+
+    #[test]
+    fn island_stays_centered_when_top_is_free() {
+        let screen = rect(0, 0, 2560, 1600);
+        let island = rect(1208, 0, 144, 51);
+        // 窗口没顶到屏幕顶部：岛下面就是壁纸，不需要躲
+        assert_eq!(
+            pick_anchor(Some(rect(100, 300, 1200, 900)), island, screen),
+            IslandAnchor::Center
+        );
+        assert_eq!(pick_anchor(None, island, screen), IslandAnchor::Center);
+    }
+
+    #[test]
+    fn maximized_window_dodges_left_by_default() {
+        // 两侧都没有空位时选左上：右上角是窗口的最小化/关闭按钮
+        let screen = rect(0, 0, 2560, 1600);
+        let island = rect(1208, 0, 144, 51);
+        assert_eq!(
+            pick_anchor(Some(rect(-8, -8, 2576, 1616)), island, screen),
+            IslandAnchor::Left
+        );
+    }
+
+    #[test]
+    fn window_on_left_dodges_right() {
+        let screen = rect(0, 0, 2560, 1600);
+        let island = rect(1208, 0, 144, 51);
+        assert_eq!(
+            pick_anchor(Some(rect(0, 0, 1700, 1200)), island, screen),
+            IslandAnchor::Right
+        );
+    }
+
+    #[test]
+    fn window_on_right_dodges_left() {
+        let screen = rect(0, 0, 2560, 1600);
+        let island = rect(1208, 0, 144, 51);
+        assert_eq!(
+            pick_anchor(Some(rect(860, 0, 1700, 1200)), island, screen),
+            IslandAnchor::Left
+        );
+    }
+
+    #[test]
+    fn narrow_free_strips_still_pick_the_larger_side() {
+        let screen = rect(0, 0, 2560, 1600);
+        let island = rect(1208, 0, 144, 51);
+        // 两侧空位都塞不下 144px，选空得多的那一侧
+        assert_eq!(
+            pick_anchor(Some(rect(20, 0, 2480, 1200)), island, screen),
+            IslandAnchor::Right
+        );
+        assert_eq!(
+            pick_anchor(Some(rect(60, 0, 2480, 1200)), island, screen),
+            IslandAnchor::Left
+        );
+    }
+
+    #[test]
+    fn fullscreen_app_hides_and_returns() {
+        let t0 = Instant::now();
+        let mut g = ModeGate::new();
+        let hidden = g.decide(
+            t0,
+            FgSnapshot {
+                fullscreen: true,
+                ..snap(FgKind::App)
+            },
+        );
+        assert_eq!(hidden, UiMode::Hidden);
+        let back = g.decide(
+            t0 + TICK,
+            FgSnapshot {
+                fullscreen: false,
+                ..snap(FgKind::App)
+            },
+        );
+        assert_eq!(back, UiMode::Island);
+    }
 }
