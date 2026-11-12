@@ -106,7 +106,7 @@ static HOME: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
 /// 首次运行没有可用配置时，卡片中心落在屏幕的这个比例位置（对应红框：上部居中）。
 const HOME_CX: f64 = 0.50;
-const HOME_CY: f64 = 0.30;
+const HOME_CY: f64 = 0.215;
 
 fn island_pos(win: &tauri::WebviewWindow) -> (i32, i32) {
     let scale = win.scale_factor().unwrap_or(1.0);
