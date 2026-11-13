@@ -222,3 +222,36 @@ test result: ok. 114 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fi
 **合并**：`6a66c6e`（merge: T6 system integration）。**票 #6 已关**（证据评论 6864970393）。
 
 ---
+
+## T7 全量验收与收官（完成 · 主 agent 亲自做 · 报告交付待用户点头）
+
+**决策依据**：spec §6 验收协议、票 #7、goal §6a 演示脚本、双轴 code-review（prompt 见 `.scratch/afk-t7-review-prompts.md`）。
+
+**双轴 code-review（并行 subagent，聚合不过滤）**：
+- **Standards 轴**：3 硬违规——① `screen_dc()`/`reset_screen_dc()` 各自内联 thread_local（两个独立 static，reset 清自己的空缓存，旧 DC 永不失效；T6 报告「已验证」与代码事实不符）；② sessionlog 时间戳格式不符 `## HH:MM`；③ native/assets 与诊断参数未同步 docs。judgement call 若干（wide() ×6、AtomicU8 布尔、b_ink6 命名等）。
+- **Spec 轴**：护栏/否决项/D1–D12 全过（grep 逐一验证）；缺项 7 条（投影未实现、形变时间轴偏离未回写 spec、T7 未做等）；范围外 5 条（右键退出最实质）；疑似错误 6 条（morph 注释漂移、hover 重建 Renderer 等）。
+
+**主 agent 逐项核验后修复轮（commit `6e101e1`）**：① screen_dc 双 thread_local 合并为一个模块级 `SCREEN_DC`；② `font::load_collection` memoize（thread_local 保活，画布重建不再重读 5 个 ttf + 重建 FontSet）；③ 移除原型遗留的右键退出（常驻应用误触即退）；④ morph 注释 3%→1.5% 漂移修正；⑤ sessionlog 时间戳改 `## HH:MM`；⑥ docs/index.md 登记 native crate（模块树 + 诊断参数）。修复后 **114 passed; 0 failed** + release 构建 + --bench paint 2.371 ms + --selftest d≥1.02 全 0（无回归）。
+**judgement-call 处置**：投影=等价省略（窗口=卡片边界，外投影被窗口裁剪，WebView 版同观感；报告注明）；morph 时间轴偏离（几何落定 vs 250/360ms）=技术限制已记录；fmt_hysteresis vs fmtPlain（0.95/1.05 滞回防单位抖动，有意为之）；双击 500ms 硬编码（窗口无 CS_DBLCLKS 自数，已注释）；press 死字段/重复 wide()/AtomicU8=低风险保留（重构收益低）；其余逐条在报告「已知限制」。
+
+**spec §6 全表实测（root-only 口径，30×10s，修复后构建 `6e101e1`，CSV `%TEMP%\afk-t7-final\`）**：
+```
+岛   : CPU 权威值 0.6581% 单核 = 0.0411% 整机（>0.3% 未达标，已知待决策项；整机 0.041%）
+       WS 中位 38.82 / p90 38.90 MB  Private 中位 12.67 / p90 13.51 MB
+展开 : CPU 权威值 1.3598% 单核 = 0.0850% 整机（<2% 达标）
+       WS 中位 45.86 / p90 46.80 MB（>40 未达标，见归因）  Private 中位 22.64 / p90 24.29 MB（<25 达标）
+隐藏 : CPU 权威值 0.0616% 单核 = 0.0038% 整机（<0.3% 达标）
+       WS 中位 38.46 / Private 中位 12.72 MB
+启动 : 3 trials avg 690ms / max 824ms（<1500ms 达标；探针坑：P/Invoke string title 传 $null 被封送为空串而非 NULL，改 IntPtr 后 PASS）
+泄漏 : 10min 12 样本 dWS +0.57 MB / dPrivate +1.33 MB（<10MB 达标）
+进程数: 物理 1（conhost=console 二进制 OS 伴生，root-only 官方口径）
+三态色: --dot green/orange/red 三次启动渲染截图（`%TEMP%\afk-t7-final\tricolor-*.png`）+ 0.4s tween 单测
+```
+**展开 WS 45.86 > 40 归因实验**：重建 T4 提交点 `57e1d4d` 同参数 10 点测量 → WS 中位 43.43（今环境）vs T4 会话报 35.89 → **35.89 是当时环境性低值**（WS 受共享内存影响）；T7 45.86 与 T4 点差 +2.4 MB = T5 ShapePainter buffer + T6 托盘/WIC 合理增量。**非代码回归，如实报「待用户决策」**。内存上涨构成：Inter 5 实例 DWrite collection、卡片玻璃离屏缓存、形变 buffer、托盘/WIC。
+
+**演示采集（goal §6a）**：`%TEMP%\afk-demo-native-render-t7\after-demo.mp4`（**54.1s**，gdigrab 30fps 560×480 区域捕获 + 受控渐变背板盖住被终端占用的真实桌面；三段：island 呼吸 12s → --morph-demo 真实 apply_mode 形变 ×5 28s → expanded 卡片 14s）。`demo verify` → 6 帧 contact sheet 0 fail/warn，主 agent 亲看：背板干净、岛态呼吸、卡片展开完整。三态截图（tricolor ×3 + card-default/hover + T5 形变帧 ×11）+ **对比页 index.html**（WebView 胶囊 before | 原生胶囊 | 原生卡片 | 形变落定 | 内嵌视频）。before 截图现拍：起 `dist\NetGlass.exe`（pid 27744，用户自启配置原状，拍后**留驻不退出**）。
+**演示坑（journal 存档）**：Shell_SystemDim（PickerHost 截图遮罩层）拦截物理 mouse_event 注入 → 改用 PostMessage 驱动交互（sendmsg 探针验证点击链路 480×300 展开 OK）；--mode/--island-pos 诊断钳制避开躲让漂移；demo 目录一个 agent 独占写。
+
+**文档同步**：docs/index.md 已登记 native crate；spec 头部状态标记待用户点头后做（P5-3 是部署切换的一部分）。
+
+**票 #7 已关**（证据评论）。全部 7 票关闭。收官报告交付 → **停在合并门**。
