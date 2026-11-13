@@ -16,6 +16,7 @@
 //!   --selftest             render offscreen, report DIB alpha inside/outside the shape
 
 mod anim;
+mod island;
 mod mode;
 mod netmon;
 mod probe;
@@ -43,9 +44,15 @@ const LOGICAL_H: f32 = mode::CARD_H as f32;
 const HIST: usize = 60;
 // wry/windows-rs does not expose WM_MOUSELEAVE; the value is stable since Win2000.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+/// 岛态呼吸/颜色过渡定时器 id（66 ms，D1 15 fps）。
+const TIMER_BREATHE: usize = 1;
 
 /// 实际显示形态。apply_mode 维护；形态线程写、UI 线程读。
 static MODE: AtomicU8 = AtomicU8::new(0);
+/// 岛态挂载点与 hover 放大状态：形态线程（躲让）与 UI 线程（hover）共享，
+/// 否则两边各算一套 target，切换时胶囊会跳回居中/缩回原尺寸。
+static ANCHOR: AtomicU8 = AtomicU8::new(0);
+static HOT: AtomicU8 = AtomicU8::new(0);
 
 /// 几何线程待呈现的矩形（UI 线程在 WM_APP_GEOMETRY 里取走）。
 static PENDING: Mutex<Option<anim::Rect>> = Mutex::new(None);
@@ -138,9 +145,21 @@ struct App {
     hist: [f64; HIST],
     unit_mb: bool,
     hover: bool,
+    /// 岛态按下（玻璃 brightness .965）。
+    active: bool,
     drag: Option<(POINT, i32, i32)>,
     rx: Receiver<netmon::Sample>,
     probe: Arc<Mutex<Option<probe::ProbePayload>>>,
+
+    /// 呼吸灯状态（66 ms 定时器；DC/隐藏/展开时回到静态点）。
+    battery: bool,
+    tint: island::TintTween,
+    dot_target: island::DotColor,
+    dot_override: Option<island::DotColor>,
+    breathe_on: bool,
+    timer_on: bool,
+    breathe_t0: Instant,
+    last_tick: Instant,
 
     title: String,
     state: String,
@@ -153,6 +172,18 @@ struct App {
 
 impl App {
     fn frame(&self) -> render::Frame {
+        let elapsed = self.breathe_t0.elapsed().as_secs_f64() * 1000.0;
+        let (alpha, scale) = if self.breathe_on {
+            island::breathe_at(elapsed)
+        } else {
+            (1.0, 1.0)
+        };
+        let phase = if self.breathe_on {
+            island::breathe_phase(elapsed)
+        } else {
+            0
+        };
+        let tint = self.tint.current();
         render::Frame {
             title: self.title.clone(),
             state: self.state.clone(),
@@ -164,6 +195,14 @@ impl App {
             proxy: self.proxy_text.clone(),
             hist: self.hist.to_vec(),
             hover: self.hover,
+            active: self.active,
+            dot: render::DotPaint {
+                rgb: tint.rgb,
+                glow: tint.glow,
+                alpha,
+                scale,
+                phase,
+            },
         }
     }
 
@@ -208,8 +247,24 @@ impl App {
         }
         self.applied = code;
         MODE.store(code, Ordering::Relaxed);
+        // 躲让（形态线程）与 hover（UI 线程）共享挂载点/放大状态。
+        self.layout.hot = HOT.load(Ordering::Relaxed) != 0;
+        self.layout.anchor = mode::anchor_from_code(ANCHOR.load(Ordering::Relaxed));
+        if m != mode::UiMode::Island {
+            self.layout.hot = false;
+            HOT.store(0, Ordering::Relaxed);
+            self.hover = false;
+            self.active = false;
+        }
 
         if m == mode::UiMode::Hidden {
+            self.breathe_on = false;
+            if self.timer_on {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_BREATHE);
+                }
+                self.timer_on = false;
+            }
             if self.visible {
                 unsafe {
                     let _ = ShowWindow(self.hwnd, SW_HIDE);
@@ -238,6 +293,62 @@ impl App {
             // 内容重画完 → 窗口矩形弹簧形变（逐帧 ULW 改尺寸）。
             anim::animate_to(target, mode::motion_for(m));
         }
+        self.sync_timer();
+    }
+
+    /// 岛态呼吸/颜色过渡的 66 ms 定时器开关（D1：15 fps，DC/隐藏/展开暂停）。
+    fn sync_timer(&mut self) {
+        let island = self.current_mode() == mode::UiMode::Island && self.visible;
+        // 形变在 T3 尚未实现（T5），morph 固定 false；展开/隐藏/电池由 should_breathe 判。
+        self.breathe_on = island::should_breathe(island, self.battery, !self.visible, false);
+        let need = island && (self.breathe_on || !self.tint.settled());
+        if need && !self.timer_on {
+            unsafe {
+                let _ = SetTimer(Some(self.hwnd), TIMER_BREATHE, island::BREATHE_TICK.as_millis() as u32, None);
+            }
+            self.timer_on = true;
+            self.last_tick = Instant::now();
+        } else if !need && self.timer_on {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_BREATHE);
+            }
+            self.timer_on = false;
+        }
+    }
+
+    fn on_timer(&mut self) {
+        let now = Instant::now();
+        let dt = (now - self.last_tick).as_secs_f64().clamp(0.0, 0.2);
+        self.last_tick = now;
+        self.tint.step(dt);
+        if self.current_mode() != mode::UiMode::Island || !self.visible {
+            return;
+        }
+        self.repaint();
+        let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+        self.present_rect(r);
+        if !self.breathe_on && self.tint.settled() {
+            self.sync_timer();
+        }
+    }
+
+    /// 岛态 hover：144×34 → 162×42 弹簧放大（窗口矩形走 ULW，不跳变）。
+    fn set_hot(&mut self, hot: bool) {
+        if self.layout.hot == hot {
+            return;
+        }
+        self.layout.hot = hot;
+        HOT.store(hot as u8, Ordering::Relaxed);
+        if !self.visible || self.current_mode() != mode::UiMode::Island {
+            return;
+        }
+        if let Some(target) = self.layout.target(mode::UiMode::Island) {
+            self.ensure_ui(target);
+            self.repaint();
+            let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+            self.present_rect(r);
+            anim::animate_to(target, mode::HOVER_MOTION);
+        }
     }
 
     fn refresh(&mut self) {
@@ -248,20 +359,46 @@ impl App {
         if let Some(s) = last {
             self.apply(&s);
         }
-        let p = self
-            .probe
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().and_then(|p| p.proxy.port));
-        self.proxy_text = match p {
+        let payload = self.probe.lock().ok().and_then(|g| g.clone());
+        self.proxy_text = match payload.as_ref().and_then(|p| p.proxy.port) {
             Some(port) => format!("代理 :{port}"),
             None => "代理 未启用".to_string(),
         };
-        // 1 Hz ticks with nothing new on screen (no traffic at all) would only
-        // burn a composite; skip them.
+
+        // 呼吸灯三态色 + DC 条件；颜色变化走 0.4 s 插值。
+        let mut dot_changed = false;
+        if let Some(p) = payload {
+            let color = self
+                .dot_override
+                .unwrap_or_else(|| island::dot_color(&p.proxy.accelerating));
+            if color != self.dot_target {
+                self.dot_target = color;
+                self.tint.set(color);
+                dot_changed = true;
+            }
+            if p.battery != self.battery {
+                self.battery = p.battery;
+                dot_changed = true;
+            }
+        }
+        self.sync_timer();
+
+        // 隐藏时不重绘/不 present：卡片内容看不见，1 Hz 全量重绘纯属浪费。
+        if !self.visible {
+            return;
+        }
+        let mut need = false;
         let key = self.content_key();
         if key != self.last_key {
             self.last_key = key;
+            need = true;
+        }
+        if dot_changed && self.current_mode() == mode::UiMode::Island {
+            need = true;
+        }
+        // 1 Hz ticks with nothing new on screen (no traffic at all) would only
+        // burn a composite; skip them.
+        if need {
             self.repaint();
             let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
             self.present_rect(r);
@@ -269,7 +406,17 @@ impl App {
     }
 
     fn content_key(&self) -> String {
-        let mut k = format!(
+        use std::fmt::Write as _;
+        // 胶囊只显示下行/上行；标题/曲线/代理都不可见，别为看不见的内容重绘。
+        if self.current_mode() == mode::UiMode::Island {
+            return format!(
+                "i|{} {}|{} {}",
+                self.down.0, self.down.1, self.up.0, self.up.1
+            );
+        }
+        let mut k = String::new();
+        let _ = write!(
+            k,
             "{}|{}|{} {}|{} {}|{}|{}|{}",
             self.title,
             self.state,
@@ -282,8 +429,7 @@ impl App {
             self.hover
         );
         for v in self.hist.iter() {
-            k.push(',');
-            k.push_str(&format!("{v:.0}"));
+            let _ = write!(k, ",{v:.0}");
         }
         k
     }
@@ -342,6 +488,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(0)
         }
+        WM_TIMER => {
+            if wp.0 == TIMER_BREATHE {
+                APP.with(|a| {
+                    if let Some(app) = a.borrow_mut().as_mut() {
+                        app.on_timer();
+                    }
+                });
+            }
+            LRESULT(0)
+        }
         WM_MOUSEMOVE => {
             APP.with(|a| {
                 if let Some(app) = a.borrow_mut().as_mut() {
@@ -358,9 +514,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             dwHoverTime: 0,
                         };
                         let _ = TrackMouseEvent(&mut tme);
-                        app.repaint();
-                        let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
-                        app.present_rect(r);
+                        if app.current_mode() == mode::UiMode::Island {
+                            app.set_hot(true);
+                        } else {
+                            app.repaint();
+                            let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+                            app.present_rect(r);
+                        }
                     }
                 }
             });
@@ -371,9 +531,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if let Some(app) = a.borrow_mut().as_mut() {
                     if app.hover {
                         app.hover = false;
-                        app.repaint();
-                        let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
-                        app.present_rect(r);
+                        if app.current_mode() == mode::UiMode::Island {
+                            app.set_hot(false);
+                        } else {
+                            app.repaint();
+                            let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+                            app.present_rect(r);
+                        }
                     }
                 }
             });
@@ -386,6 +550,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let cur = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
                     app.drag = Some((c, cur.x, cur.y));
                     SetCapture(hwnd);
+                    if app.current_mode() == mode::UiMode::Island && !app.active {
+                        app.active = true;
+                        app.repaint();
+                        let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+                        app.present_rect(r);
+                    }
                 }
             });
             LRESULT(0)
@@ -394,6 +564,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             APP.with(|a| {
                 if let Some(app) = a.borrow_mut().as_mut() {
                     app.drag = None;
+                    if app.active {
+                        app.active = false;
+                        app.repaint();
+                        let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+                        app.present_rect(r);
+                    }
                     // 拖动落点成为新的桌面锚点（展开态才有意义）
                     if app.current_mode() == mode::UiMode::Expanded {
                         let cur = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
@@ -415,6 +591,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
+}
+
+unsafe extern "system" fn bench_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wp, lp)
 }
 
 fn screen_rect() -> anim::Rect {
@@ -497,12 +677,70 @@ fn log_line(s: &str) {
     }
 }
 
+/// 诊断用形态钳制（`--mode=island|expanded|hidden`）：测量/截图时保持单一形态，
+/// 不影响正常运行路径（不传就是 auto）。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ModeOverride {
+    Island,
+    Expanded,
+    Hidden,
+}
+
+fn parse_mode_override(args: &[String]) -> Option<ModeOverride> {
+    let mut i = 0;
+    while i < args.len() {
+        let value = if let Some(v) = args[i].strip_prefix("--mode=") {
+            Some(v.to_string())
+        } else if args[i] == "--mode" && i + 1 < args.len() {
+            Some(args[i + 1].clone())
+        } else {
+            None
+        };
+        if let Some(v) = value {
+            return match v.as_str() {
+                "island" => Some(ModeOverride::Island),
+                "expanded" => Some(ModeOverride::Expanded),
+                "hidden" => Some(ModeOverride::Hidden),
+                _ => None,
+            };
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_dot_override(args: &[String]) -> Option<island::DotColor> {
+    let mut i = 0;
+    while i < args.len() {
+        let value = if let Some(v) = args[i].strip_prefix("--dot=") {
+            Some(v.to_string())
+        } else if args[i] == "--dot" && i + 1 < args.len() {
+            Some(args[i + 1].clone())
+        } else {
+            None
+        };
+        if let Some(v) = value {
+            return match v.as_str() {
+                "green" => Some(island::DotColor::Green),
+                "orange" => Some(island::DotColor::Orange),
+                "red" => Some(island::DotColor::Red),
+                _ => None,
+            };
+        }
+        i += 1;
+    }
+    None
+}
+
 fn run(args: &[String]) -> Result<()> {
     let scale = window::dpi_scale();
     let screen = screen_rect();
     let silent = args.iter().any(|a| a == "--silent");
+    let mode_override = parse_mode_override(args);
+    let dot_override = parse_dot_override(args);
+    let island_pos = window::parse_points(args, "--island-pos").first().copied();
     eprintln!(
-        "[boot] args={args:?} silent={silent} scale={scale} dpi={} screen={}x{}",
+        "[boot] args={args:?} silent={silent} scale={scale} dpi={} screen={}x{} mode={mode_override:?}",
         unsafe { GetDpiForSystem() },
         screen.w,
         screen.h
@@ -518,21 +756,34 @@ fn run(args: &[String]) -> Result<()> {
         home,
         hot: false,
         anchor: mode::IslandAnchor::Center,
+        island_pos,
     };
     let card = layout.card();
 
+    let start_visible = !silent && mode_override != Some(ModeOverride::Hidden);
+    // 静默启动从胶囊态起步：gate 必须先走满 2 s 桌面 settle 才会给出 Expanded，
+    // 在此之前 show_on_decide 一律不显窗（P1-3）。非静默直接以展开态冷启动。
+    let initial_mode = match mode_override {
+        Some(ModeOverride::Island) => mode::UiMode::Island,
+        Some(ModeOverride::Expanded) => mode::UiMode::Expanded,
+        Some(ModeOverride::Hidden) => mode::UiMode::Hidden,
+        None if silent => mode::UiMode::Island,
+        None => mode::UiMode::Expanded,
+    };
+    let initial_rect = layout.target(initial_mode).unwrap_or(card);
+
     let cfg = window::WindowConfig {
-        x: card.x,
-        y: card.y,
-        w: card.w,
-        h: card.h,
-        visible: !silent,
+        x: initial_rect.x,
+        y: initial_rect.y,
+        w: initial_rect.w,
+        h: initial_rect.h,
+        visible: start_visible,
     };
     let hwnd = window::create_window(&cfg, Some(wndproc))?;
-    let ui = Ui::new(Some(hwnd), card.w, card.h, scale)?;
+    let ui = Ui::new(Some(hwnd), initial_rect.w, initial_rect.h, scale)?;
     let raw = hwnd.0 as isize;
     if let Ok(mut g) = PRESENTED.lock() {
-        *g = card;
+        *g = initial_rect;
     }
 
     let (tx, rx) = mpsc::channel::<netmon::Sample>();
@@ -632,27 +883,28 @@ fn run(args: &[String]) -> Result<()> {
         });
     }
 
-    // 静默启动从胶囊态起步：gate 必须先走满 2 s 桌面 settle 才会给出 Expanded，
-    // 在此之前 show_on_decide 一律不显窗（P1-3）。非静默直接以展开态冷启动。
-    let initial_mode = if silent {
-        mode::UiMode::Island
-    } else {
-        mode::UiMode::Expanded
-    };
-
-    let app = App {
+    let mut app = App {
         ui,
         hwnd,
         scale,
         layout,
         applied: mode::mode_code(initial_mode),
-        visible: !silent,
+        visible: start_visible,
         hist: [0.0; HIST],
         unit_mb: true,
         hover: false,
+        active: false,
         drag: None,
         rx,
         probe: probe_state,
+        battery: false,
+        tint: island::TintTween::new(dot_override.unwrap_or(island::DotColor::Green)),
+        dot_target: dot_override.unwrap_or(island::DotColor::Green),
+        dot_override,
+        breathe_on: false,
+        timer_on: false,
+        breathe_t0: Instant::now(),
+        last_tick: Instant::now(),
         title: "正在读取".to_string(),
         state: "—".to_string(),
         wifi: "Wi-Fi —".to_string(),
@@ -662,10 +914,11 @@ fn run(args: &[String]) -> Result<()> {
         last_key: String::new(),
     };
     app.repaint();
-    app.present_rect(card);
+    app.present_rect(initial_rect);
+    app.sync_timer();
     MODE.store(mode::mode_code(initial_mode), Ordering::Relaxed);
     APP.with(|a| *a.borrow_mut() = Some(app));
-    VISIBLE_FLAG.store(if silent { 0 } else { 1 }, Ordering::Relaxed);
+    VISIBLE_FLAG.store(start_visible as u8, Ordering::Relaxed);
 
     // 形变线程：apply 把每帧矩形交给 UI 线程呈现；current 读窗口当前矩形。
     anim::start(
@@ -678,7 +931,7 @@ fn run(args: &[String]) -> Result<()> {
             }),
             current: Box::new(|| PRESENTED.lock().ok().map(|g| *g)),
         },
-        card,
+        initial_rect,
     );
 
     // 形态线程：260 ms 前台轮询 → ModeGate → 三态（spec D3 维持 260 ms）。
@@ -689,7 +942,11 @@ fn run(args: &[String]) -> Result<()> {
             let warmup = Instant::now();
             let mut last_other = unsafe { GetForegroundWindow() };
             let mut gate = mode::ModeGate::new();
-            let mut silent_pending = silent;
+            // --mode=hidden 直接落到 D6 的托盘隐藏路径（测量隐藏态用）。
+            if mode_override == Some(ModeOverride::Hidden) {
+                gate.set_manual_hidden(true);
+            }
+            let mut silent_pending = silent && mode_override.is_none();
             let mut anchor = mode::IslandAnchor::Center;
             loop {
                 std::thread::sleep(mode::POLL);
@@ -710,10 +967,16 @@ fn run(args: &[String]) -> Result<()> {
 
                 let kind = mode::classify_fg(&class);
                 let current = mode::mode_from_code(MODE.load(Ordering::Relaxed));
+                // hover 放大由 UI 线程写 HOT；躲让重算 target 时必须用同一尺寸，
+                // 否则 hover 中遇到躲让会把胶囊缩回 144×34。
+                layout.hot = HOT.load(Ordering::Relaxed) != 0;
 
                 // 前台窗口压住顶部居中时躲到没被覆盖的一角；只是平移窗口，
                 // 不换内容。任务栏/Alt+Tab 覆盖层保持当前挂载点，避免来回跳。
-                let next_anchor = if kind == mode::FgKind::App {
+                // --island-pos 诊断把胶囊钉死后不再躲让（测量/截图不被前台变化污染）。
+                let next_anchor = if layout.island_pos.is_some() {
+                    anchor
+                } else if kind == mode::FgKind::App {
                     match fg_window_rect(fg) {
                         Some(rect) => mode::pick_anchor(
                             Some(rect),
@@ -731,6 +994,7 @@ fn run(args: &[String]) -> Result<()> {
                 if next_anchor != anchor {
                     anchor = next_anchor;
                     layout.anchor = anchor;
+                    ANCHOR.store(mode::anchor_code(anchor), Ordering::Relaxed);
                     log_line(&format!("anchor {:?} fg={class}", anchor));
                     if current == mode::UiMode::Island {
                         if let Some(r) = layout.target(current) {
@@ -739,7 +1003,7 @@ fn run(args: &[String]) -> Result<()> {
                     }
                 }
 
-                let want = gate.decide(
+                let mut want = gate.decide(
                     Instant::now(),
                     mode::FgSnapshot {
                         kind,
@@ -750,6 +1014,13 @@ fn run(args: &[String]) -> Result<()> {
                         already_expanded: current == mode::UiMode::Expanded,
                     },
                 );
+                if let Some(m) = mode_override {
+                    want = match m {
+                        ModeOverride::Island => mode::UiMode::Island,
+                        ModeOverride::Expanded => mode::UiMode::Expanded,
+                        ModeOverride::Hidden => mode::UiMode::Hidden,
+                    };
+                }
                 if want == mode::UiMode::Expanded {
                     silent_pending = false;
                 }
@@ -855,6 +1126,8 @@ fn bench() -> Result<()> {
         proxy: "代理 :7897".to_string(),
         hist,
         hover: false,
+        active: false,
+        dot: render::DotPaint::default(),
     };
     renderer.paint(&frame)?;
     println!("after 1st paint    = {:.1} MB", ws_mb());
@@ -867,6 +1140,80 @@ fn bench() -> Result<()> {
     let per = t0.elapsed().as_secs_f64() * 1000.0 / 120.0;
     println!("paint: {:.3} ms/frame ({} frames)", per, 120);
     println!("after 120 paints   = {:.1} MB", ws_mb());
+
+    // 胶囊态 paint 成本（T3 呼吸灯 15 fps 的预算依据）。
+    let iw = (mode::ISLAND_W * scale as f64).round() as i32;
+    let ih = (mode::ISLAND_H * scale as f64).round() as i32;
+    let island_surface = window::Surface::new(None, iw, ih)?;
+    let island_renderer = render::Renderer::new(island_surface.mem_dc, iw, ih, scale)?;
+    let island_frame = render::Frame {
+        title: String::new(),
+        state: String::new(),
+        down_value: "2.9".to_string(),
+        down_unit: "MB/s".to_string(),
+        up_value: "148".to_string(),
+        up_unit: "KB/s".to_string(),
+        wifi: String::new(),
+        proxy: String::new(),
+        hist: Vec::new(),
+        hover: false,
+        active: false,
+        dot: render::DotPaint::default(),
+    };
+    island_renderer.paint_island(&island_frame)?;
+    island_renderer.bench_island_parts(&island_frame)?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..300 {
+        island_renderer.paint_island(&island_frame)?;
+    }
+    let per = t0.elapsed().as_secs_f64() * 1000.0 / 300.0;
+    println!(
+        "island paint: {:.3} ms/frame (300 frames, {}x{} physical)",
+        per, iw, ih
+    );
+    println!("after island paint = {:.1} MB", ws_mb());
+
+    // ULW 呈现成本：在真实 layered window 上量（呼吸帧的固定开销）。
+    let cfg = window::WindowConfig {
+        x: 0,
+        y: 0,
+        w: iw,
+        h: ih,
+        visible: true,
+    };
+    let bench_hwnd = window::create_window(&cfg, Some(bench_proc))?;
+    let present_surface = window::Surface::new(Some(bench_hwnd), iw, ih)?;
+    let present_renderer = render::Renderer::new(present_surface.mem_dc, iw, ih, scale)?;
+    present_renderer.paint_island(&island_frame)?;
+    present_surface.present_rect(0, 0, iw, ih)?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..300 {
+        present_surface.present_rect(0, 0, iw, ih)?;
+    }
+    println!(
+        "present only: {:.3} ms/frame (300 frames)",
+        t0.elapsed().as_secs_f64() * 1000.0 / 300.0
+    );
+    let t0 = std::time::Instant::now();
+    for _ in 0..300 {
+        present_renderer.paint_island(&island_frame)?;
+        present_surface.present_rect(0, 0, iw, ih)?;
+    }
+    println!(
+        "island paint+present: {:.3} ms/frame (300 frames)",
+        t0.elapsed().as_secs_f64() * 1000.0 / 300.0
+    );
+    let t0 = std::time::Instant::now();
+    for _ in 0..50 {
+        let _ = probe::proxy_state();
+    }
+    println!(
+        "proxy_state: {:.3} ms/call (50 calls, 2s probe path)",
+        t0.elapsed().as_secs_f64() * 1000.0 / 50.0
+    );
+    unsafe {
+        let _ = DestroyWindow(bench_hwnd);
+    }
     Ok(())
 }
 
@@ -895,6 +1242,8 @@ fn selftest() -> Result<()> {
         proxy: "代理 :7897".to_string(),
         hist,
         hover: false,
+        active: false,
+        dot: render::DotPaint::default(),
     };
     renderer.paint(&frame)?;
 
@@ -950,5 +1299,61 @@ fn selftest() -> Result<()> {
     println!(
         "outside ellipse (d>1.0): alpha>0 pixels={outside_any} | at d>=1.02: pixels={outside_far} max_alpha={max_far_alpha}"
     );
+
+    // 胶囊态：圆角矩形之外必须全透明（AA 边带除外）。
+    let iw = (mode::ISLAND_W * scale as f64).round() as i32;
+    let ih = (mode::ISLAND_H * scale as f64).round() as i32;
+    let island_surface = window::Surface::new(None, iw, ih)?;
+    let island_renderer = render::Renderer::new(island_surface.mem_dc, iw, ih, scale)?;
+    let island_frame = render::Frame {
+        title: String::new(),
+        state: String::new(),
+        down_value: "2.9".to_string(),
+        down_unit: "MB/s".to_string(),
+        up_value: "148".to_string(),
+        up_unit: "KB/s".to_string(),
+        wifi: String::new(),
+        proxy: String::new(),
+        hist: Vec::new(),
+        hover: false,
+        active: false,
+        dot: render::DotPaint::default(),
+    };
+    island_renderer.paint_island(&island_frame)?;
+    let radius = island::capsule_radius(iw as f32, ih as f32, scale);
+    let mut cap_any = 0u32;
+    let mut cap_far = 0u32;
+    let mut cap_max = 0u8;
+    for y in 0..ih {
+        for x in 0..iw {
+            let d = rounded_rect_sdf(x as f32 + 0.5, y as f32 + 0.5, iw as f32, ih as f32, radius);
+            if d > 0.0 {
+                let a = island_surface.alpha_at(x, y);
+                if a > 0 {
+                    cap_any += 1;
+                    if d >= 1.02 {
+                        cap_far += 1;
+                        cap_max = cap_max.max(a);
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "capsule canvas: {iw}x{ih} physical (scale {scale}, radius {radius:.2}) center={} corner={}",
+        island_surface.alpha_at(iw / 2, ih / 2),
+        island_surface.alpha_at(2, 2)
+    );
+    println!(
+        "outside capsule (d>0): alpha>0 pixels={cap_any} | at d>=1.02: pixels={cap_far} max_alpha={cap_max}"
+    );
     Ok(())
+}
+
+/// 圆角矩形有符号距离（负=内部），用于胶囊 alpha 审计。
+fn rounded_rect_sdf(px: f32, py: f32, w: f32, h: f32, r: f32) -> f32 {
+    let qx = (px - w / 2.0).abs() - (w / 2.0 - r);
+    let qy = (py - h / 2.0).abs() - (h / 2.0 - r);
+    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    outside + qx.max(qy).min(0.0) - r
 }

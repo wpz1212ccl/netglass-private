@@ -276,31 +276,6 @@ fn listener_pids() -> Vec<u32> {
     }
 }
 
-/// 定向查单个 PID 的 exe 名（小写）。比全量快照便宜两个数量级。
-fn exe_name(pid: u32) -> Option<String> {
-    use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    unsafe {
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buf = [0u16; 260];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(
-            h,
-            windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
-            windows::core::PWSTR(buf.as_mut_ptr()),
-            &mut len,
-        )
-        .is_ok();
-        let _ = CloseHandle(h);
-        if !ok {
-            return None;
-        }
-        let s = String::from_utf16_lossy(&buf[..len as usize]);
-        Some(s.rsplit('\\').next().unwrap_or(&s).to_lowercase())
-    }
-}
-
 /// 「在运行」展示用全量快照 10s 兜底；加速判定走 2s 廉价路径，不受它滞后。
 static PROC_CACHE: Mutex<(Option<Instant>, Vec<(String, u32)>)> = Mutex::new((None, Vec::new()));
 
@@ -316,22 +291,54 @@ fn processes_cached() -> Vec<(String, u32)> {
     running_processes()
 }
 
-/// (运行中, 正在加速)。加速判定 2s 廉价路径：监听表 PID 定向查 exe 名 +
-/// hosts mtime 门控，不依赖进程缓存（新启动加速器 ≤2-3s 反映）；
-/// 「在运行」展示用 10s 兜底快照，加速中的标签立即并入。
-fn accelerator_state() -> (Vec<String>, Vec<String>) {
-    let listener_names: Vec<String> = listener_pids().iter().filter_map(|p| exe_name(*p)).collect();
-    let mut accelerating: Vec<String> = Vec::new();
+/// 监听 PID → 已知加速器标签（按 KNOWN 顺序、按标签去重）。
+/// 纯函数：把"每 2s 逐个 OpenProcess 查 exe 名"换成一次进程快照查表。
+fn accelerating_labels(pids: &[u32], procs: &[(String, u32)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
     for (exe, label) in KNOWN {
-        if listener_names.iter().any(|n| n == exe) && !accelerating.iter().any(|a| a == label) {
-            accelerating.push((*label).to_string());
+        let hit = pids
+            .iter()
+            .any(|pid| procs.iter().any(|(p, id)| id == pid && p == exe));
+        if hit && !out.iter().any(|a| a == label) {
+            out.push((*label).to_string());
         }
     }
+    out
+}
+
+/// 取进程快照；监听 PID 不在 10s 缓存里（新启动的加速器）就刷新一次。
+/// 已退出的 PID 会一直"缺失"，所以只在快照确实超过 2s 时才全量重枚举，
+/// 避免每 2s 触发一次进程枚举。
+fn process_snapshot_for(pids: &[u32]) -> Vec<(String, u32)> {
+    let mut procs = processes_cached();
+    let missing = pids.iter().any(|pid| !procs.iter().any(|(_, p)| p == pid));
+    if missing {
+        let stale = PROC_CACHE
+            .lock()
+            .ok()
+            .and_then(|g| g.0)
+            .map(|t| t.elapsed() >= Duration::from_secs(2))
+            .unwrap_or(true);
+        if stale {
+            procs = running_processes();
+            if let Ok(mut g) = PROC_CACHE.lock() {
+                *g = (Some(Instant::now()), procs.clone());
+            }
+        }
+    }
+    procs
+}
+
+/// (运行中, 正在加速)。加速判定 2s 廉价路径：监听表 PID + 进程快照查表 +
+/// hosts mtime 门控（新启动加速器 ≤2-3s 反映）；「在运行」展示同一份快照。
+fn accelerator_state() -> (Vec<String>, Vec<String>) {
+    let pids = listener_pids();
+    let procs = process_snapshot_for(&pids);
+    let mut accelerating = accelerating_labels(&pids, &procs);
     if watt_hosts_accelerating() && !accelerating.iter().any(|a| a == "Watt") {
         accelerating.push("Watt".to_string());
     }
 
-    let procs = processes_cached();
     let mut running: Vec<String> = Vec::new();
     for (exe, label) in KNOWN {
         if (procs.iter().any(|(p, _)| p == exe) || accelerating.iter().any(|a| a == label))
@@ -382,7 +389,40 @@ pub fn offline_payload() -> ProbePayload {
 
 #[cfg(test)]
 mod tests {
-    use super::hosts_block_active;
+    use super::{accelerating_labels, hosts_block_active};
+
+    fn procs(v: &[(&str, u32)]) -> Vec<(String, u32)> {
+        v.iter().map(|(s, p)| (s.to_string(), *p)).collect()
+    }
+
+    #[test]
+    fn accelerating_labels_match_known_exes() {
+        let pids = [10, 20, 30];
+        let procs = procs(&[
+            ("sakuracat.exe", 10),
+            ("core.exe", 20),
+            ("chrome.exe", 30),
+        ]);
+        assert_eq!(accelerating_labels(&pids, &procs), vec!["SakuraCat"]);
+    }
+
+    #[test]
+    fn accelerating_labels_dedup_and_keep_known_order() {
+        let pids = [1, 2, 3];
+        let procs = procs(&[
+            ("steam++.accelerator.exe", 2),
+            ("uu.exe", 3),
+            ("steam++.exe", 1),
+        ]);
+        assert_eq!(accelerating_labels(&pids, &procs), vec!["Watt", "UU"]);
+    }
+
+    #[test]
+    fn accelerating_labels_ignore_processes_without_listener() {
+        let pids = [1];
+        let procs = procs(&[("sakuracat.exe", 2)]);
+        assert!(accelerating_labels(&pids, &procs).is_empty());
+    }
 
     #[test]
     fn active_block_is_accelerating() {
