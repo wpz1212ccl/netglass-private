@@ -1,9 +1,9 @@
 # AFK journal — 原生渲染切换（native-render）
 
 **状态**
-- 已完成：T1（D9 成立）、T2（29 绿，`a096467`）、T3 胶囊态（43 绿，`715b121`，#3 已关）、T4 展开卡片（58 绿，`57e1d4d`，#4 已关，root-only 全达标，rubric 8.8）、T5 形变/数字弹簧（84 绿，`0e744fe`，#5 已关，rubric 9.0）
-- 进行中：T6 系统集成（即将派发，`.scratch/afk-t6-prompt.md` 已备）
-- 下一步：T7 全量验收收官（双轴 code-review + 演示 + 收官报告，停在合并门）
+- 已完成：T1（D9 成立）、T2（29 绿，`a096467`）、T3 胶囊态（43 绿，`715b121`，#3 已关）、T4 展开卡片（58 绿，`57e1d4d`，#4 已关，root-only 全达标，rubric 8.8）、T5 形变/数字弹簧（84 绿，`0e744fe`，#5 已关，rubric 9.0）、T6 系统集成（114 绿，`6a66c6e`，#6 已关：托盘/快捷键/自启/config/单实例/DPI，7 项回归全过，用户注册表与 config 已恢复原值）
+- 进行中：T7 全量验收与收官（主 agent 亲自做：双轴 code-review → 修复轮 → spec §6 全表实测 → 演示采集 → 收官报告）
+- 下一步：T7 完成后交付报告，**停在合并门等用户点头**
 - **T4 视觉复核（主 agent 亲自看图）**：`card-default.png` / `card-hover.png` 里 35px squircle、Inter 数字「114/118」字距紧、5 格 hover 详情（延迟 23ms / 峰值 118 KB/s / 链路 243 Mbps / 上行峰值 30 KB/s / 代理 未加速）、蓝色曲线、底栏交叉淡出均在，层次符合 iOS 小组件范式。但两张图左侧有竖直暗带 + 小圆角矩形叠影；`desktop-full.png` 显示屏幕被最大化浏览器占满、左上角仍有常驻 WebView2 版 NetGlass 胶囊（「2.9 MB/s ↑ 148 KB/s」）→ **是常驻版叠在原生卡片左边缘，属证据构图问题、非产品缺陷**（goal §3a 已预警并存重叠）。已要求 T4 用 `--mode=expanded --pos` 摆到空白区 + `--hit` 探坐标补拍 clean 版。
 - **T4 主 agent 复跑 `--bench`**：paint **2.560 ms/帧**（T4 报 2.26，环境波动，均 <5 ms 门槛 → D9 仍成立）；`--selftest` 卡片 squircle 与胶囊 `d>=1.02` 像素 0 / max_alpha 0，且打印 `font Inter, collection sees Inter = true, weights=[400,450,500,560,600,...]`。`outside-samples` 前 8 点非零是因为旧椭圆采样点现在落在 squircle 内部（审计已改为 squircle 距离判定），逻辑自洽，T7 留意即可。
 - **T4 展开态测量复核（主 agent 按 CSV 独立复算）**：`measure-expanded.csv` 23 点 → sum_dcpu 4.1097s / sum_dt 233.45s = **1.7604% 单核 = 0.11% 整机**（<2% 阈值，**达标**）；逐点中位 1.6269 / p90 2.5146；Private 中位 23.41 MB（<25 达标）；**WS 中位 47.41 MB > 40 MB 阈值（未达标）**。CSV 恒 `n=2`，主 agent 独立核实 `Get-Process netglass-native` 物理只有 **1 个**进程（PID 13480，Start 1:10:29）且无子进程 → `n=2` 是测量脚本 `Get-TreeIds` 统计口径偏差（非真派生），spec「进程数=1」物理成立。WS 较 T3 岛态 23 MB 上涨归因：卡片玻璃离屏缓存 + Inter 5 静态实例 + 自定义 DWrite font collection（`--bench` 的 25.3/29.1 MB 是进程内阶段值，与常驻稳态不同口径）。已要求 T4 重测确认；若仍 >40 MB，按「内存部分达标、待用户决策」如实上报（与岛态 CPU 项并列）。
@@ -191,5 +191,34 @@ test result: ok. 84 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 **已知取舍**：进场不等 250/360ms 而等几何落定（展开≈500ms/收回≈400ms）——原生无 WebView 中间尺寸重排能力，差几像素即拉伸文字；观感与前端同量级。
 
 **合并**：`0e744fe`（merge: T5 morph spring + number animation）。**票 #5 已关**（证据评论 6863245499）。worktree 待清理。
+
+---
+
+## T6 系统集成（完成 · implementer 完工 · 主 agent 复核合并）
+
+**决策依据**：spec §3 Phase 4（P4-1..P4-5）、票 #6、goal §4 D10、`src-tauri/src/main.rs` 现版对照。
+
+**做了什么**（implementer，commit `80fb954`，11 文件 +2106/−8）：新增 `tray.rs`（Shell_NotifyIconW + WIC 解码 PNG → CreateIconIndirect + 独立可激活菜单 owner 窗）、`menu.rs`（菜单结构/ID/勾选态纯逻辑）、`hotkey.rs`（候选序 Ctrl+Alt+L→N→Shift+L→F9 与现版逐字一致含 MOD_NOREPEAT）、`autostart.rs`（HKCU Run，自检只碰临时值名 NetGlassT6Selftest）、`config.rs`（手写 JSON 与 serde_json pretty 逐字一致，有 assert_eq 单测）、`instance.rs`（CreateMutexW + 唤醒既有窗）、`lock.rs`；`window.rs` 加 reset_screen_dc()（T3 复核留的联动项已处理）；`main.rs` 接线全部 + 诊断参数 --icon/--tray-menu/--autostart-selftest/--config/--dpi-test；`assets/tray.png` 复制进 native。
+
+**复核（主 agent 亲自跑 + 抽查）**：
+- t6 worktree 与合并后主树各跑一遍 `cargo test` → **114 passed; 0 failed**；release 构建通过；护栏 `git diff --stat 5f607d7..t6-integration -- src-tauri src` 空。
+- `Cargo.toml` diff 亲阅：仅同一 windows 0.62.2 依赖追加 5 个 feature，注释说明用途，**D10 合规零新增 crate**。
+- 关键断言抽查：config pretty 排版逐字单测、autostart 临时值名隔离、hotkey 候选序、reset_screen_dc 联动。
+- **用户机器状态亲自验证**：`reg query` HKCU Run → `dist\NetGlass.exe --silent` 原值；config.json → x:1041/y:196/locked:false/autostart:null 原值（与测试前快照一致）。
+- S 级亲验：托盘菜单截图四项 + 分隔线 + 快捷键名 + 勾选态齐全。
+- 7 项回归全过（托盘菜单全功能/左键显隐/跨重启保持/单实例唤醒/快捷键锁定/DPI 1.5×→2.0×→1.0×/测试尾行）。
+
+**A 级证据（原样尾行）**：
+```
+running 114 tests
+...........................
+test result: ok. 114 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+```
+
+**implementer 解决的关键问题**：① TrackPopupMenu 假死（NOACTIVATE 主窗 SetForegroundWindow 必败 → 独立 owner 窗 + AttachThreadInput 有界 + 拿不到前台权就不弹菜单）；② RefCell already borrowed panic（托盘句柄移 thread_local）；③ LoadImageW 读不了 PNG（WIC 解码）；④ 跨屏不一定有 WM_DPICHANGED（2s GetDpiForWindow 轮询兜底双路径）。
+
+**已知限制**：单屏无法真跨屏拖动（DPI 用 --dpi-test 走真实代码路径取证）；锁定后右键穿透与现版一致；托盘图标在 Win11 溢出区折叠（Shell_NotifyIconGetRect + PrintWindow 双佐证注册有效）。
+
+**合并**：`6a66c6e`（merge: T6 system integration）。**票 #6 已关**（证据评论 6864970393）。
 
 ---
