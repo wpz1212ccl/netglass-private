@@ -1566,6 +1566,8 @@ impl Renderer {
             let layout = card::details_layout(lh_cell / self.scale, asc_cell / self.scale);
             let row_base = |i: usize| self.p(layout.baselines[i]) + dy + self.p(fx.details_dy);
             let cells = fx.cells;
+            let gap = self.p(card::DETAILS_GAP_X);
+            let col_w = (right - left - gap) / 2.0;
             for (i, row) in [(0usize, 0usize), (1, 0), (2, 1), (3, 1), (4, 2)] {
                 let cell = &f.details[i];
                 let alpha = container_alpha * cells[i].alpha;
@@ -1573,16 +1575,24 @@ impl Renderer {
                     continue;
                 }
                 let y = row_base(row) + self.p(cells[i].dy);
+                // 2 列 grid：偶数列左半、奇数列右半；span2 占满整行。
+                let (col_left, col_right) = if cell.span2 {
+                    (left, right)
+                } else if i % 2 == 0 {
+                    (left, left + col_w)
+                } else {
+                    (left + col_w + gap, right)
+                };
                 let value_w = self.measure_feat(&cell.value, &self.f_cell_val, true, self.p(-0.053));
                 let label_brush = &self.b_ink2;
                 let value_brush = self.tone_brush(cell.tone);
                 Self::set_alpha(label_brush, alpha);
                 Self::set_alpha(value_brush, alpha);
-                self.draw_baseline(&cell.label, &self.f_cell, left, y, label_brush, false, 0.0)?;
+                self.draw_baseline(&cell.label, &self.f_cell, col_left, y, label_brush, false, 0.0)?;
                 self.draw_baseline(
                     &cell.value,
                     &self.f_cell_val,
-                    right - value_w,
+                    col_right - value_w,
                     y,
                     value_brush,
                     true,
