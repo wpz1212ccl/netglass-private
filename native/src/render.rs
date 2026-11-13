@@ -16,6 +16,9 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{AlphaBlend, BitBlt, HDC, BLENDFUNCTION, SRCCOPY};
 use windows_numerics::{Matrix3x2, Vector2};
 
+use crate::card;
+use crate::font;
+use crate::fx;
 use crate::island;
 use crate::window;
 
@@ -50,10 +53,19 @@ pub struct Frame {
     pub down_unit: String,
     pub up_value: String,
     pub up_unit: String,
+    /// 底栏 Wi-Fi 值（已连接/未连接/无）。
     pub wifi: String,
+    pub wifi_ok: bool,
+    /// 底栏代理值（`Watt 加速中` / `23 ms` / `未启用` …）。
     pub proxy: String,
+    pub proxy_tone: card::Tone,
+    /// hover 详情 5 格。
+    pub details: [card::DetailRow; 5],
     pub hist: Vec<f64>,
+    /// 岛态 hover / 展开态 hover 布尔（T3 胶囊提亮仍用它）。
     pub hover: bool,
+    /// 展开态 hover 时间轴（详情错峰/底栏曲线淡出/内容上浮）。
+    pub hover_fx: fx::HoverFx,
     /// 岛态按下（`.card.collapsed:active`，玻璃压暗一档）。
     pub active: bool,
     pub dot: DotPaint,
@@ -72,6 +84,22 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+fn vadd(a: Vector2, b: Vector2) -> Vector2 {
+    Vector2::new(a.X + b.X, a.Y + b.Y)
+}
+
+fn vsub(a: Vector2, b: Vector2) -> Vector2 {
+    Vector2::new(a.X - b.X, a.Y - b.Y)
+}
+
+fn vmul(a: Vector2, k: f32) -> Vector2 {
+    Vector2::new(a.X * k, a.Y * k)
+}
+
+fn vlen(a: Vector2) -> f32 {
+    (a.X * a.X + a.Y * a.Y).sqrt()
+}
+
 pub struct Renderer {
     factory: ID2D1Factory,
     dwrite: IDWriteFactory,
@@ -82,6 +110,9 @@ pub struct Renderer {
     h: f32,
     /// 主 DIB 的 DC（rt 平时绑它；画静态层时临时改绑，再切回来）。
     mem_dc: HDC,
+    family: &'static str,
+    /// 进程内 Inter collection；text formats 引用它，必须活到 Renderer drop。
+    collection: Option<IDWriteFontCollection>,
 
     f_title: IDWriteTextFormat,
     f_state: IDWriteTextFormat,
@@ -90,6 +121,9 @@ pub struct Renderer {
     f_up: IDWriteTextFormat,
     f_upunit: IDWriteTextFormat,
     f_foot: IDWriteTextFormat,
+    f_foot_b: IDWriteTextFormat,
+    f_cell: IDWriteTextFormat,
+    f_cell_val: IDWriteTextFormat,
     f_mdown: IDWriteTextFormat,
     f_munit: IDWriteTextFormat,
     f_mup: IDWriteTextFormat,
@@ -101,15 +135,26 @@ pub struct Renderer {
     b_ink3: ID2D1SolidColorBrush,
     b_ink6: ID2D1SolidColorBrush,
     b_ink55: ID2D1SolidColorBrush,
-    b_white: ID2D1SolidColorBrush,
     b_hair72: ID2D1SolidColorBrush,
     b_hair85: ID2D1SolidColorBrush,
     b_dot: ID2D1SolidColorBrush,
     b_base: ID2D1SolidColorBrush,
-    b_glass: ID2D1LinearGradientBrush,
-    b_glass_hover: ID2D1LinearGradientBrush,
-    b_line: ID2D1LinearGradientBrush,
-    b_area: ID2D1LinearGradientBrush,
+    b_warn: ID2D1SolidColorBrush,
+    b_err: ID2D1SolidColorBrush,
+    /// 9 档玻璃亮度（0=普通，8=`.card:hover`），按 hover 时间轴量化选择。
+    glass: Vec<ID2D1LinearGradientBrush>,
+    b_hl1: ID2D1RadialGradientBrush,
+    b_hl2: ID2D1RadialGradientBrush,
+    b_blue: ID2D1RadialGradientBrush,
+    b_bottom: ID2D1LinearGradientBrush,
+
+    /// 35px squircle 路径（缓存，形状不变就不重建）。
+    card_path: ID2D1PathGeometry,
+    card_rim: ID2D1PathGeometry,
+    icon_wifi: ID2D1PathGeometry,
+    icon_wifi_slash: ID2D1PathGeometry,
+    icon_bolt: ID2D1PathGeometry,
+
     pill_normal: Pill,
     pill_hot: Pill,
     pill_active: Pill,
@@ -118,6 +163,10 @@ pub struct Renderer {
     island_static: RefCell<Option<IslandStatic>>,
     /// 呼吸点预渲染：32 个相位帧排成一条位图，呼吸帧只 AlphaBlend 一格。
     dot_tiles: RefCell<Option<DotTiles>>,
+    /// 曲线离屏缓存：hist 变了才重画一次，hover 淡出只改合成透明度。
+    chart: RefCell<Option<ChartCache>>,
+    /// 静态卡片底（玻璃 5 层 + 内发丝）：只随 hover 亮度档变化，缓存成位图。
+    card_bg: RefCell<Option<CardBg>>,
 }
 
 struct IslandStatic {
@@ -130,6 +179,21 @@ struct DotTiles {
     key: String,
     tile: i32,
     surface: window::Surface,
+}
+
+struct CardBg {
+    mix: usize,
+    target: ID2D1BitmapRenderTarget,
+    bitmap: ID2D1Bitmap,
+}
+
+struct ChartCache {
+    key: String,
+    target: ID2D1BitmapRenderTarget,
+    bitmap: ID2D1Bitmap,
+    line: ID2D1LinearGradientBrush,
+    area: ID2D1LinearGradientBrush,
+    base: ID2D1SolidColorBrush,
 }
 
 /// `.pillbg` 的三层材质：172° 主渐变 + 左上/右上两团径向高光。
@@ -173,7 +237,6 @@ impl Renderer {
         };
         unsafe { rt.BindDC(mem_dc, &rect)? };
 
-
         let caps_props = D2D1_STROKE_STYLE_PROPERTIES {
             startCap: D2D1_CAP_STYLE_ROUND,
             endCap: D2D1_CAP_STYLE_ROUND,
@@ -186,20 +249,31 @@ impl Renderer {
         let caps = unsafe { factory.CreateStrokeStyle(&caps_props, None)? };
 
         let s = scale;
-        let display = "Segoe UI Variable Display";
-        let text = "Segoe UI Variable Text";
+        // D11：Inter 静态实例（400/450/500/560/600）建成进程内 DWrite collection。
+        // 建 collection 失败时退回原型用的 Segoe UI Variable（并记日志）。
+        let (collection, family): (Option<IDWriteFontCollection>, &'static str) =
+            match font::load_collection(&dwrite)
+                .and_then(|c| c.cast::<IDWriteFontCollection>().ok())
+            {
+                Some(c) => (Some(c), "Inter"),
+                None => (None, "Segoe UI Variable Text"),
+            };
+        let coll = collection.as_ref();
 
-        let f_title = Self::fmt(&dwrite, text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 13.0 * s)?;
-        let f_state = Self::fmt(&dwrite, text, DWRITE_FONT_WEIGHT_NORMAL, 11.0 * s)?;
-        let f_num = Self::fmt(&dwrite, display, DWRITE_FONT_WEIGHT_SEMI_BOLD, 44.0 * s)?;
-        let f_unit = Self::fmt(&dwrite, text, DWRITE_FONT_WEIGHT_MEDIUM, 13.0 * s)?;
-        let f_up = Self::fmt(&dwrite, text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0 * s)?;
-        let f_upunit = Self::fmt(&dwrite, text, DWRITE_FONT_WEIGHT_MEDIUM, 11.0 * s)?;
-        let f_foot = Self::fmt(&dwrite, text, DWRITE_FONT_WEIGHT_MEDIUM, 11.0 * s)?;
+        let f_title = Self::fmt(&dwrite, coll, family, DWRITE_FONT_WEIGHT_SEMI_BOLD, 13.0 * s)?;
+        let f_state = Self::fmt(&dwrite, coll, family, DWRITE_FONT_WEIGHT(450), 11.0 * s)?;
+        let f_num = Self::fmt(&dwrite, coll, family, DWRITE_FONT_WEIGHT_SEMI_BOLD, 46.0 * s)?;
+        let f_unit = Self::fmt(&dwrite, coll, family, DWRITE_FONT_WEIGHT_MEDIUM, 13.0 * s)?;
+        let f_up = Self::fmt(&dwrite, coll, family, DWRITE_FONT_WEIGHT(560), 14.0 * s)?;
+        let f_upunit = Self::fmt(&dwrite, coll, family, DWRITE_FONT_WEIGHT_MEDIUM, 11.0 * s)?;
+        let f_foot = Self::fmt(&dwrite, coll, family, DWRITE_FONT_WEIGHT_MEDIUM, 11.0 * s)?;
+        let f_foot_b = Self::fmt(&dwrite, coll, family, DWRITE_FONT_WEIGHT_SEMI_BOLD, 11.0 * s)?;
+        let f_cell = Self::fmt(&dwrite, coll, family, DWRITE_FONT_WEIGHT(450), 10.5 * s)?;
+        let f_cell_val = Self::fmt(&dwrite, coll, family, DWRITE_FONT_WEIGHT(550), 10.5 * s)?;
         // 胶囊迷你数字：15px/600 + 10px 单位 + 10px 上行（#mDown/#mUnit/.mup）。
-        let f_mdown = Self::fmt(&dwrite, display, DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0 * s)?;
-        let f_munit = Self::fmt(&dwrite, text, DWRITE_FONT_WEIGHT_NORMAL, 10.0 * s)?;
-        let f_mup = Self::fmt(&dwrite, text, DWRITE_FONT_WEIGHT_NORMAL, 10.0 * s)?;
+        let f_mdown = Self::fmt(&dwrite, coll, family, DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0 * s)?;
+        let f_munit = Self::fmt(&dwrite, coll, family, DWRITE_FONT_WEIGHT_NORMAL, 10.0 * s)?;
+        let f_mup = Self::fmt(&dwrite, coll, family, DWRITE_FONT_WEIGHT_NORMAL, 10.0 * s)?;
 
         let typo = unsafe { dwrite.CreateTypography()? };
         unsafe {
@@ -214,71 +288,99 @@ impl Renderer {
         let b_ink3 = unsafe { rt.CreateSolidColorBrush(&c(18, 21, 26, 0.50), None)? };
         let b_ink6 = unsafe { rt.CreateSolidColorBrush(&c(18, 21, 26, 0.60), None)? };
         let b_ink55 = unsafe { rt.CreateSolidColorBrush(&c(18, 21, 26, 0.55), None)? };
-        let b_white = unsafe { rt.CreateSolidColorBrush(&c(255, 255, 255, 0.90), None)? };
         let b_hair72 = unsafe { rt.CreateSolidColorBrush(&c(255, 255, 255, 0.72), None)? };
         let b_hair85 = unsafe { rt.CreateSolidColorBrush(&c(255, 255, 255, 0.85), None)? };
         let b_dot = unsafe { rt.CreateSolidColorBrush(&c(52, 199, 89, 1.0), None)? };
         let b_base = unsafe { rt.CreateSolidColorBrush(&c(18, 21, 26, 0.10), None)? };
+        let b_warn = unsafe { rt.CreateSolidColorBrush(&c(196, 106, 0, 1.0), None)? };
+        let b_err = unsafe { rt.CreateSolidColorBrush(&c(255, 59, 48, 1.0), None)? };
 
         let pill_normal = Self::pill(&rt, w as f32, h as f32, island::glass_brightness(false, false))?;
         let pill_hot = Self::pill(&rt, w as f32, h as f32, island::glass_brightness(true, false))?;
         let pill_active = Self::pill(&rt, w as f32, h as f32, island::glass_brightness(false, true))?;
 
-        let glass_stops = [
-            D2D1_GRADIENT_STOP {
-                position: 0.0,
-                color: c(255, 255, 255, 0.34),
-            },
-            D2D1_GRADIENT_STOP {
-                position: 1.0,
-                color: c(246, 248, 252, 0.20),
-            },
-        ];
-        let b_glass = Self::grad(&rt, &glass_stops, Vector2::new(0.0, 0.0), Vector2::new(0.0, h as f32))?;
+        // `.card` 的 172° 玻璃：普通/悬停两套 stop 之间插 9 档，hover 时逐帧量化。
+        let (gs, ge) = Self::linear_172(w as f32, h as f32);
+        let mut glass = Vec::with_capacity(9);
+        for i in 0..=8 {
+            let t = i as f32 / 8.0;
+            let stops = Self::glass_stops(t);
+            glass.push(Self::grad(&rt, &stops, gs, ge)?);
+        }
 
-        let hover_stops = [
-            D2D1_GRADIENT_STOP {
-                position: 0.0,
-                color: c(255, 255, 255, 0.42),
-            },
-            D2D1_GRADIENT_STOP {
-                position: 1.0,
-                color: c(246, 248, 252, 0.26),
-            },
+        let hl1 = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: c(255, 255, 255, 0.28) },
+            D2D1_GRADIENT_STOP { position: 0.58, color: c(255, 255, 255, 0.0) },
+            D2D1_GRADIENT_STOP { position: 1.0, color: c(255, 255, 255, 0.0) },
         ];
-        let b_glass_hover = Self::grad(&rt, &hover_stops, Vector2::new(0.0, 0.0), Vector2::new(0.0, h as f32))?;
+        let b_hl1 = Self::radial(
+            &rt,
+            &hl1,
+            Vector2::new(w as f32 * 0.18, -(h as f32) * 0.12),
+            w as f32 * 1.2,
+            h as f32 * 0.9,
+        )?;
+        let hl2 = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: c(255, 255, 255, 0.16) },
+            D2D1_GRADIENT_STOP { position: 0.62, color: c(255, 255, 255, 0.0) },
+            D2D1_GRADIENT_STOP { position: 1.0, color: c(255, 255, 255, 0.0) },
+        ];
+        let b_hl2 = Self::radial(
+            &rt,
+            &hl2,
+            Vector2::new(w as f32, 0.0),
+            w as f32 * 0.9,
+            h as f32 * 0.7,
+        )?;
+        let blue = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: c(10, 132, 255, 0.045) },
+            D2D1_GRADIENT_STOP { position: 0.62, color: c(10, 132, 255, 0.0) },
+            D2D1_GRADIENT_STOP { position: 1.0, color: c(10, 132, 255, 0.0) },
+        ];
+        let b_blue = Self::radial(
+            &rt,
+            &blue,
+            Vector2::new(w as f32 * 0.06, h as f32 * 1.08),
+            w as f32 * 0.7,
+            h as f32 * 0.5,
+        )?;
+        let bottom = [
+            D2D1_GRADIENT_STOP { position: 0.72, color: c(18, 28, 48, 0.0) },
+            D2D1_GRADIENT_STOP { position: 1.0, color: c(18, 28, 48, 0.035) },
+        ];
+        let b_bottom = Self::grad(
+            &rt,
+            &bottom,
+            Vector2::new(0.0, 0.0),
+            Vector2::new(0.0, h as f32),
+        )?;
 
-        let line_stops = [
-            D2D1_GRADIENT_STOP {
-                position: 0.0,
-                color: c(10, 132, 255, 0.35),
-            },
-            D2D1_GRADIENT_STOP {
-                position: 0.70,
-                color: c(10, 132, 255, 1.0),
-            },
-            D2D1_GRADIENT_STOP {
-                position: 1.0,
-                color: c(0, 102, 214, 1.0),
-            },
-        ];
-        let b_line = Self::grad(&rt, &line_stops, Vector2::new(0.0, 0.0), Vector2::new(w as f32, 0.0))?;
-
-        let area_stops = [
-            D2D1_GRADIENT_STOP {
-                position: 0.0,
-                color: c(10, 132, 255, 0.30),
-            },
-            D2D1_GRADIENT_STOP {
-                position: 0.55,
-                color: c(10, 132, 255, 0.09),
-            },
-            D2D1_GRADIENT_STOP {
-                position: 1.0,
-                color: c(10, 132, 255, 0.0),
-            },
-        ];
-        let b_area = Self::grad(&rt, &area_stops, Vector2::new(0.0, 0.0), Vector2::new(0.0, h as f32))?;
+        let radius = card::RADIUS * s;
+        let steps = 8;
+        let card_path = Self::squircle_geometry(
+            &factory,
+            0.0,
+            0.0,
+            w as f32,
+            h as f32,
+            radius,
+            card::EXPONENT,
+            steps,
+        )?;
+        let inset = 0.25 * s;
+        let card_rim = Self::squircle_geometry(
+            &factory,
+            inset,
+            inset,
+            w as f32 - inset * 2.0,
+            h as f32 - inset * 2.0,
+            (radius - inset).max(0.0),
+            card::EXPONENT,
+            steps,
+        )?;
+        let icon_scale = 11.0 * s / 16.0;
+        let (icon_wifi, icon_wifi_slash) = Self::wifi_geometries(&factory, icon_scale)?;
+        let icon_bolt = Self::bolt_geometry(&factory, icon_scale)?;
 
         Ok(Self {
             factory,
@@ -289,6 +391,8 @@ impl Renderer {
             w: w as f32,
             h: h as f32,
             mem_dc,
+            family,
+            collection,
             f_title,
             f_state,
             f_num,
@@ -296,6 +400,9 @@ impl Renderer {
             f_up,
             f_upunit,
             f_foot,
+            f_foot_b,
+            f_cell,
+            f_cell_val,
             f_mdown,
             f_munit,
             f_mup,
@@ -305,30 +412,70 @@ impl Renderer {
             b_ink3,
             b_ink6,
             b_ink55,
-            b_white,
             b_hair72,
             b_hair85,
             b_dot,
             b_base,
-            b_glass,
-            b_glass_hover,
-            b_line,
-            b_area,
+            b_warn,
+            b_err,
+            glass,
+            b_hl1,
+            b_hl2,
+            b_blue,
+            b_bottom,
+            card_path,
+            card_rim,
+            icon_wifi,
+            icon_wifi_slash,
+            icon_bolt,
             pill_normal,
             pill_hot,
             pill_active,
             island_static: RefCell::new(None),
             dot_tiles: RefCell::new(None),
+            chart: RefCell::new(None),
+            card_bg: RefCell::new(None),
         })
     }
 
-    fn fmt(dwrite: &IDWriteFactory, family: &str, weight: DWRITE_FONT_WEIGHT, size: f32) -> Result<IDWriteTextFormat> {
+    pub fn font_family(&self) -> &'static str {
+        self.family
+    }
+
+    /// 自证：进程内 collection 是否真的能看到 Inter（否则会静默回退）。
+    pub fn dwrite_has_family(&self, family: &str) -> bool {
+        self.collection
+            .as_ref()
+            .map(|c| font::has_family(c, family))
+            .unwrap_or(false)
+    }
+
+    /// 系统 collection 是否看到（预期 false：AddFontMemResourceEx 不喂 DWrite）。
+    pub fn system_has_family(&self, family: &str) -> bool {
+        font::system_has_family(&self.dwrite, family)
+    }
+
+    /// 诊断：collection 里 Inter 的字重列表。
+    pub fn family_weights(&self, family: &str) -> Vec<i32> {
+        self.collection
+            .as_ref()
+            .map(|c| font::family_weights(c, family))
+            .unwrap_or_default()
+    }
+
+    fn fmt(
+        dwrite: &IDWriteFactory,
+        collection: Option<&IDWriteFontCollection>,
+        family: &str,
+        weight: DWRITE_FONT_WEIGHT,
+        size: f32,
+    ) -> Result<IDWriteTextFormat> {
         let fam = wide(family);
         let loc = wide("zh-CN");
         let f = unsafe {
             dwrite.CreateTextFormat(
                 PCWSTR(fam.as_ptr()),
-                None,
+                collection,
                 weight,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
@@ -389,6 +536,25 @@ impl Renderer {
         )
     }
 
+    /// 普通 ↔ hover 玻璃 stop 插值（t=0 普通，t=1 hover）。
+    fn glass_stops(t: f32) -> [D2D1_GRADIENT_STOP; 3] {
+        let a = |normal: f32, hover: f32| normal + (hover - normal) * t;
+        [
+            D2D1_GRADIENT_STOP {
+                position: 0.0,
+                color: c(255, 255, 255, a(0.36, 0.44)),
+            },
+            D2D1_GRADIENT_STOP {
+                position: 0.46,
+                color: c(252, 253, 255, a(0.22, 0.28)),
+            },
+            D2D1_GRADIENT_STOP {
+                position: 1.0,
+                color: c(244, 247, 252, a(0.26, 0.32)),
+            },
+        ]
+    }
+
     fn stop(pos: f32, r: u8, g: u8, b: u8, a: f32, brightness: f32) -> D2D1_GRADIENT_STOP {
         let m = |v: u8| (v as f32 * brightness).round().clamp(0.0, 255.0) as u8;
         D2D1_GRADIENT_STOP {
@@ -422,6 +588,144 @@ impl Renderer {
         })
     }
 
+    /// 35px 连续曲率卡片轮廓：四角超椭圆（分段三次贝塞尔），四边直线。
+    fn squircle_geometry(
+        factory: &ID2D1Factory,
+        x0: f32,
+        y0: f32,
+        w: f32,
+        h: f32,
+        r: f32,
+        n: f32,
+        steps: usize,
+    ) -> Result<ID2D1PathGeometry> {
+        let pts = card::outline(w, h, r, n, steps);
+        let m = steps + 1;
+        let chains: [&[(f32, f32)]; 4] = [
+            &pts[0..m],
+            &pts[m..2 * m],
+            &pts[2 * m..3 * m],
+            &pts[3 * m..4 * m],
+        ];
+        let to_v = |(x, y): (f32, f32)| Vector2::new(x0 + x, y0 + y);
+        let tl: Vec<Vector2> = chains[0].iter().map(|&p| to_v(p)).collect();
+        let tr: Vec<Vector2> = chains[1].iter().map(|&p| to_v(p)).collect();
+        let br: Vec<Vector2> = chains[2].iter().map(|&p| to_v(p)).collect();
+        let bl: Vec<Vector2> = chains[3].iter().map(|&p| to_v(p)).collect();
+
+        let geo = unsafe { factory.CreatePathGeometry()? };
+        let sink = unsafe { geo.Open()? };
+        unsafe {
+            sink.BeginFigure(tl[0], D2D1_FIGURE_BEGIN_FILLED);
+            Self::add_corner(&sink, &tl, Vector2::new(0.0, -1.0), Vector2::new(1.0, 0.0));
+            sink.AddLine(tr[0]);
+            Self::add_corner(&sink, &tr, Vector2::new(1.0, 0.0), Vector2::new(0.0, 1.0));
+            sink.AddLine(br[0]);
+            Self::add_corner(&sink, &br, Vector2::new(0.0, 1.0), Vector2::new(-1.0, 0.0));
+            sink.AddLine(bl[0]);
+            Self::add_corner(&sink, &bl, Vector2::new(-1.0, 0.0), Vector2::new(0.0, -1.0));
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close()?;
+        }
+        Ok(geo)
+    }
+
+    /// 把一条角点链拟合成 C1 连续的三次贝塞尔；端点切线显式给定，
+    /// 保证与直边相接处没有折角。
+    fn add_corner(
+        sink: &ID2D1GeometrySink,
+        pts: &[Vector2],
+        start_dir: Vector2,
+        end_dir: Vector2,
+    ) {
+        let n = pts.len();
+        let mut tangents = Vec::with_capacity(n);
+        let start_len = vlen(vsub(pts[1], pts[0]));
+        let end_len = vlen(vsub(pts[n - 1], pts[n - 2]));
+        for i in 0..n {
+            let t = if i == 0 {
+                vmul(start_dir, start_len)
+            } else if i == n - 1 {
+                vmul(end_dir, end_len)
+            } else {
+                vmul(vsub(pts[i + 1], pts[i - 1]), 0.5)
+            };
+            tangents.push(t);
+        }
+        for i in 0..n - 1 {
+            let seg = D2D1_BEZIER_SEGMENT {
+                point1: vadd(pts[i], vmul(tangents[i], 1.0 / 3.0)),
+                point2: vsub(pts[i + 1], vmul(tangents[i + 1], 1.0 / 3.0)),
+                point3: pts[i + 1],
+            };
+            unsafe {
+                sink.AddBezier(&seg);
+            }
+        }
+    }
+
+    /// Wi-Fi 图标（viewBox 16 → 11px）：两道弧 + 斜杠。
+    fn wifi_geometries(
+        factory: &ID2D1Factory,
+        s: f32,
+    ) -> Result<(ID2D1PathGeometry, ID2D1PathGeometry)> {
+        let arcs = unsafe { factory.CreatePathGeometry()? };
+        let sink = unsafe { arcs.Open()? };
+        unsafe {
+            sink.BeginFigure(Vector2::new(2.0 * s, 6.2 * s), D2D1_FIGURE_BEGIN_HOLLOW);
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: Vector2::new(14.0 * s, 6.2 * s),
+                size: D2D_SIZE_F { width: 9.0 * s, height: 9.0 * s },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.EndFigure(D2D1_FIGURE_END_OPEN);
+            sink.BeginFigure(Vector2::new(4.4 * s, 8.7 * s), D2D1_FIGURE_BEGIN_HOLLOW);
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: Vector2::new(11.6 * s, 8.7 * s),
+                size: D2D_SIZE_F { width: 5.4 * s, height: 5.4 * s },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.EndFigure(D2D1_FIGURE_END_OPEN);
+            sink.Close()?;
+        }
+        let slash = unsafe { factory.CreatePathGeometry()? };
+        let sink = unsafe { slash.Open()? };
+        unsafe {
+            sink.BeginFigure(Vector2::new(2.6 * s, 13.4 * s), D2D1_FIGURE_BEGIN_HOLLOW);
+            sink.AddLine(Vector2::new(13.4 * s, 2.6 * s));
+            sink.EndFigure(D2D1_FIGURE_END_OPEN);
+            sink.Close()?;
+        }
+        Ok((arcs, slash))
+    }
+
+    /// 代理闪电图标（viewBox 16 → 11px）。
+    fn bolt_geometry(factory: &ID2D1Factory, s: f32) -> Result<ID2D1PathGeometry> {
+        let pts = [
+            (8.9, 1.9),
+            (4.4, 8.9),
+            (7.4, 8.9),
+            (6.7, 14.1),
+            (11.6, 6.7),
+            (8.4, 6.7),
+        ];
+        let geo = unsafe { factory.CreatePathGeometry()? };
+        let sink = unsafe { geo.Open()? };
+        unsafe {
+            sink.BeginFigure(Vector2::new(pts[0].0 * s, pts[0].1 * s), D2D1_FIGURE_BEGIN_HOLLOW);
+            for p in &pts[1..] {
+                sink.AddLine(Vector2::new(p.0 * s, p.1 * s));
+            }
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close()?;
+        }
+        Ok(geo)
+    }
+
     fn p(&self, logical: f32) -> f32 {
         logical * self.scale
     }
@@ -438,50 +742,24 @@ impl Renderer {
         }
     }
 
-    /// Draws `text` with its baseline at `baseline_y`, left edge at `x`. Returns advance width.
-    fn draw_text(
-        &self,
-        text: &str,
-        fmt: &IDWriteTextFormat,
-        x: f32,
-        baseline_y: f32,
-        brush: &ID2D1Brush,
-    ) -> Result<f32> {
-        if text.is_empty() {
-            return Ok(0.0);
-        }
-        let lay = self.layout(text, fmt)?;
-        let mut m = DWRITE_TEXT_METRICS::default();
+    /// 单行文本的 (自然行高, 基线)。
+    fn line_metrics(&self, text: &str, fmt: &IDWriteTextFormat) -> (f32, f32) {
+        let Ok(lay) = self.layout(text, fmt) else {
+            return (0.0, 0.0);
+        };
         let mut lm = [DWRITE_LINE_METRICS::default(); 1];
         let mut n = 0u32;
         unsafe {
-            lay.GetMetrics(&mut m)?;
-            lay.GetLineMetrics(Some(&mut lm), &mut n)?;
+            let _ = lay.GetLineMetrics(Some(&mut lm), &mut n);
         }
-        let origin = Vector2::new(x, baseline_y - lm[0].baseline);
-        unsafe {
-            self.rt.DrawTextLayout(origin, &lay, brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
-        }
-        Ok(m.widthIncludingTrailingWhitespace)
-    }
-
-    fn measure(&self, text: &str, fmt: &IDWriteTextFormat) -> f32 {
-        if text.is_empty() {
-            return 0.0;
-        }
-        match self.layout(text, fmt) {
-            Ok(lay) => {
-                let mut m = DWRITE_TEXT_METRICS::default();
-                unsafe {
-                    let _ = lay.GetMetrics(&mut m);
-                }
-                m.widthIncludingTrailingWhitespace
-            }
-            Err(_) => 0.0,
+        if n == 0 {
+            (0.0, 0.0)
+        } else {
+            (lm[0].height, lm[0].baseline)
         }
     }
 
-    /// 胶囊数字用：tabular-nums（等宽数字）+ 可选字距。
+    /// tabular-nums（等宽数字）+ 可选字距（DIP，已乘 scale）。
     fn layout_feat(
         &self,
         text: &str,
@@ -535,6 +813,37 @@ impl Renderer {
         }
     }
 
+    /// 按基线画单行文本，返回宽度。
+    fn draw_baseline(
+        &self,
+        text: &str,
+        fmt: &IDWriteTextFormat,
+        x: f32,
+        baseline: f32,
+        brush: &ID2D1Brush,
+        tabular: bool,
+        tracking: f32,
+    ) -> Result<f32> {
+        if text.is_empty() {
+            return Ok(0.0);
+        }
+        let lay = self.layout_feat(text, fmt, tabular, tracking)?;
+        let mut lm = [DWRITE_LINE_METRICS::default(); 1];
+        let mut n = 0u32;
+        let mut m = DWRITE_TEXT_METRICS::default();
+        unsafe {
+            lay.GetLineMetrics(Some(&mut lm), &mut n)?;
+            lay.GetMetrics(&mut m)?;
+            self.rt.DrawTextLayout(
+                Vector2::new(x, baseline - lm[0].baseline),
+                &lay,
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+            );
+        }
+        Ok(m.widthIncludingTrailingWhitespace)
+    }
+
     /// 单行文本按视觉行高垂直居中（对照 flex align-items:center）。
     fn draw_text_vcentered(
         &self,
@@ -564,6 +873,20 @@ impl Renderer {
             );
         }
         Ok(m.widthIncludingTrailingWhitespace)
+    }
+
+    fn set_alpha(brush: &ID2D1Brush, a: f32) {
+        unsafe {
+            brush.SetOpacity(a.clamp(0.0, 1.0));
+        }
+    }
+
+    fn tone_brush(&self, tone: card::Tone) -> &ID2D1SolidColorBrush {
+        match tone {
+            card::Tone::Normal => &self.b_ink2,
+            card::Tone::Warn => &self.b_warn,
+            card::Tone::Error => &self.b_err,
+        }
     }
 
     /// 呼吸灯：实心圆 + 6 层同心圆近似 box-shadow 光晕。
@@ -601,20 +924,22 @@ impl Renderer {
         Ok(())
     }
 
+    /// `.glyph` 地球：13px 方框、viewBox 16、stroke 1.7。
     fn draw_globe(&self, cx: f32, cy: f32) -> Result<()> {
-        let r = self.p(6.3);
+        let r = self.p(4.55);
+        let stroke = self.p(1.38);
         unsafe {
             let e = D2D1_ELLIPSE {
                 point: Vector2::new(cx, cy),
                 radiusX: r,
                 radiusY: r,
             };
-            self.rt.DrawEllipse(&e, &self.b_ink2, self.p(1.15), &self.caps);
+            self.rt.DrawEllipse(&e, &self.b_ink2, stroke, &self.caps);
             self.rt.DrawLine(
                 Vector2::new(cx - r, cy),
                 Vector2::new(cx + r, cy),
                 &self.b_ink2,
-                self.p(1.1),
+                stroke,
                 &self.caps,
             );
             let meridian = D2D1_ELLIPSE {
@@ -622,41 +947,77 @@ impl Renderer {
                 radiusX: r * 0.44,
                 radiusY: r,
             };
-            self.rt.DrawEllipse(&meridian, &self.b_ink2, self.p(1.1), &self.caps);
+            self.rt.DrawEllipse(&meridian, &self.b_ink2, stroke, &self.caps);
         }
         Ok(())
     }
 
-    fn draw_up_arrow(&self, x: f32, baseline_y: f32) -> Result<()> {
-        let w = self.p(9.0);
-        let top = baseline_y - self.p(8.6);
-        let mid = x + w / 2.0;
+    /// 上行箭头（viewBox 12 → 9px），底边落在基线上。
+    fn draw_up_arrow(&self, x: f32, baseline: f32) -> Result<()> {
+        let s = self.p(0.75);
+        let top = baseline - self.p(9.0);
+        let stroke = self.p(1.5);
+        let px = |v: f32| x + v * s;
+        let py = |v: f32| top + v * s;
         unsafe {
             self.rt.DrawLine(
-                Vector2::new(mid, baseline_y - self.p(0.6)),
-                Vector2::new(mid, top),
+                Vector2::new(px(6.0), py(9.6)),
+                Vector2::new(px(6.0), py(3.0)),
                 &self.b_ink3,
-                self.p(1.6),
+                stroke,
                 &self.caps,
             );
             self.rt.DrawLine(
-                Vector2::new(mid - w * 0.32, top + w * 0.32),
-                Vector2::new(mid, top),
+                Vector2::new(px(3.2), py(5.6)),
+                Vector2::new(px(6.0), py(2.8)),
                 &self.b_ink3,
-                self.p(1.6),
+                stroke,
                 &self.caps,
             );
             self.rt.DrawLine(
-                Vector2::new(mid, top),
-                Vector2::new(mid + w * 0.32, top + w * 0.32),
+                Vector2::new(px(6.0), py(2.8)),
+                Vector2::new(px(8.8), py(5.6)),
                 &self.b_ink3,
-                self.p(1.6),
+                stroke,
                 &self.caps,
             );
         }
         Ok(())
     }
 
+    fn draw_wifi(&self, x: f32, cy: f32) -> Result<()> {
+        let s = 11.0 * self.scale / 16.0;
+        let top = cy - self.p(5.5);
+        unsafe {
+            self.rt.SetTransform(&Matrix3x2::translation(x, top));
+            self.rt.DrawGeometry(&self.icon_wifi, &self.b_ink3, 1.8 * s, &self.caps);
+            self.rt.DrawGeometry(&self.icon_wifi_slash, &self.b_ink3, 1.5 * s, &self.caps);
+            self.rt.SetTransform(&Matrix3x2::identity());
+            self.b_dot.SetColor(&c(18, 21, 26, 0.50));
+            self.rt.FillEllipse(
+                &D2D1_ELLIPSE {
+                    point: Vector2::new(x + 8.0 * s, top + 11.9 * s),
+                    radiusX: 0.9 * s,
+                    radiusY: 0.9 * s,
+                },
+                &self.b_dot,
+            );
+        }
+        Ok(())
+    }
+
+    fn draw_bolt(&self, x: f32, cy: f32) -> Result<()> {
+        let s = 11.0 * self.scale / 16.0;
+        let top = cy - self.p(5.5);
+        unsafe {
+            self.rt.SetTransform(&Matrix3x2::translation(x, top));
+            self.rt.DrawGeometry(&self.icon_bolt, &self.b_ink3, 1.8 * s, &self.caps);
+            self.rt.SetTransform(&Matrix3x2::identity());
+        }
+        Ok(())
+    }
+
+    /// 60 点 3 点平滑曲线 + 填充区域；纵轴下限 64 KB/s（对照 `build()`）。
     fn spark_geometry(
         &self,
         values: &[f64],
@@ -664,9 +1025,9 @@ impl Renderer {
         right: f32,
         top: f32,
         base: f32,
+        area_bottom: f32,
     ) -> Result<(ID2D1PathGeometry, ID2D1PathGeometry)> {
         let n = values.len();
-        // 纵轴下限 64 KB/s，并做 3 点平滑：低速时不要把几 KB 的噪声放大成满屏山丘。
         let max = values.iter().cloned().fold(0.0f64, f64::max).max(65536.0) * 1.18;
         let pts: Vec<Vector2> = (0..n)
             .map(|i| {
@@ -716,8 +1077,8 @@ impl Renderer {
                     });
                 }
                 sink.AddLine(pts[n - 1]);
-                sink.AddLine(Vector2::new(right, base));
-                sink.AddLine(Vector2::new(left, base));
+                sink.AddLine(Vector2::new(right, area_bottom));
+                sink.AddLine(Vector2::new(left, area_bottom));
                 sink.EndFigure(D2D1_FIGURE_END_CLOSED);
                 sink.Close()?;
             }
@@ -725,95 +1086,540 @@ impl Renderer {
         Ok((line, area))
     }
 
+    fn chart_size(&self) -> (f32, f32) {
+        (self.w - self.p(card::PAD_X) * 2.0, self.p(card::CHART_H))
+    }
+
+    /// 曲线坐标映射：viewBox 320×66 → 卡片上的 276×56（preserveAspectRatio=none）。
+    fn chart_rect(&self) -> (f32, f32, f32, f32) {
+        let left = self.p(card::PAD_X);
+        let top = self.p(card::CARD_H - card::CHART_H);
+        let (cw, ch) = self.chart_size();
+        (left, top, cw, ch)
+    }
+
+    fn chart_key(f: &Frame) -> String {
+        use std::fmt::Write as _;
+        let mut k = String::new();
+        if f.hist.iter().cloned().fold(0.0f64, f64::max) < 1024.0 {
+            k.push('f');
+        } else {
+            for v in &f.hist {
+                let _ = write!(k, "{v:.0},");
+            }
+        }
+        k
+    }
+
+    fn new_chart_cache(&self) -> Result<ChartCache> {
+        let (cw, ch) = self.chart_size();
+        let size = D2D_SIZE_F {
+            width: cw,
+            height: ch,
+        };
+        let target = unsafe {
+            self.rt.CreateCompatibleRenderTarget(
+                Some(&size),
+                None,
+                None,
+                D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,
+            )?
+        };
+        let line_stops = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: c(10, 132, 255, 0.35) },
+            D2D1_GRADIENT_STOP { position: 0.70, color: c(10, 132, 255, 1.0) },
+            D2D1_GRADIENT_STOP { position: 1.0, color: c(0, 102, 214, 1.0) },
+        ];
+        let line = Self::grad(&target, &line_stops, Vector2::new(0.0, 0.0), Vector2::new(cw, 0.0))?;
+        let area_stops = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: c(10, 132, 255, 0.30) },
+            D2D1_GRADIENT_STOP { position: 0.55, color: c(10, 132, 255, 0.09) },
+            D2D1_GRADIENT_STOP { position: 1.0, color: c(10, 132, 255, 0.0) },
+        ];
+        let area = Self::grad(&target, &area_stops, Vector2::new(0.0, 0.0), Vector2::new(0.0, ch))?;
+        let base = unsafe { target.CreateSolidColorBrush(&c(18, 21, 26, 0.10), None)? };
+        let bitmap = unsafe { target.GetBitmap()? };
+        Ok(ChartCache {
+            key: String::new(),
+            target,
+            bitmap,
+            line,
+            area,
+            base,
+        })
+    }
+
+    /// 把曲线画进离屏位图，同时把左右 26px 渐隐 mask 烘进去（1 Hz 重建一次）。
+    /// 之后每帧只需一次 DrawBitmap，hover 淡出只改统一 opacity。
+    fn build_chart(&self, cache: &mut ChartCache, f: &Frame) -> Result<()> {
+        let (cw, ch) = self.chart_size();
+        let vy = |v: f32| v / 66.0 * ch;
+        let top = vy(17.0);
+        let base = vy(57.0);
+        let target = &cache.target;
+        unsafe {
+            target.BeginDraw();
+            target.Clear(Some(&c(0, 0, 0, 0.0)));
+            target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        }
+        let flat = f.hist.iter().cloned().fold(0.0f64, f64::max) < 1024.0;
+        let (line, area) = if flat {
+            (None, None)
+        } else {
+            let (l, a) = self.spark_geometry(&f.hist, 0.0, cw, top, base, ch)?;
+            (Some(l), Some(a))
+        };
+        let draw = |op: f32| -> Result<()> {
+            unsafe {
+                cache.base.SetOpacity(op);
+                if let Some(a) = &area {
+                    cache.area.SetOpacity(op);
+                    target.FillGeometry(a, &cache.area, None);
+                }
+                if let Some(l) = &line {
+                    cache.line.SetOpacity(op);
+                    target.DrawGeometry(l, &cache.line, self.p(1.5), &self.caps);
+                }
+            }
+            if flat {
+                unsafe {
+                    target.DrawLine(
+                        Vector2::new(0.0, vy(57.6)),
+                        Vector2::new(cw, vy(57.6)),
+                        &cache.base,
+                        self.p(0.6),
+                        None,
+                    );
+                }
+            }
+            Ok(())
+        };
+        let fade = (26.0 * self.scale).round().max(1.0);
+        let band = 2.0f32;
+        let mut x = 0.0f32;
+        while x < fade {
+            let x1 = (x + band).min(fade);
+            let mask = ((x + x1) / 2.0 / fade).clamp(0.0, 1.0);
+            let clip = D2D_RECT_F {
+                left: x,
+                top: 0.0,
+                right: x1,
+                bottom: ch,
+            };
+            unsafe {
+                target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
+            }
+            draw(mask)?;
+            unsafe {
+                target.PopAxisAlignedClip();
+            }
+            x = x1;
+        }
+        let mut x = 0.0f32;
+        while x < fade {
+            let x1 = (x + band).min(fade);
+            let mask = ((x + x1) / 2.0 / fade).clamp(0.0, 1.0);
+            let clip = D2D_RECT_F {
+                left: cw - fade + x,
+                top: 0.0,
+                right: cw - fade + x1,
+                bottom: ch,
+            };
+            unsafe {
+                target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
+            }
+            draw(mask)?;
+            unsafe {
+                target.PopAxisAlignedClip();
+            }
+            x = x1;
+        }
+        let clip = D2D_RECT_F {
+            left: fade,
+            top: 0.0,
+            right: cw - fade,
+            bottom: ch,
+        };
+        unsafe {
+            target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
+        }
+        draw(1.0)?;
+        unsafe {
+            target.PopAxisAlignedClip();
+            target.EndDraw(None, None)?;
+        }
+        cache.bitmap = unsafe { target.GetBitmap()? };
+        Ok(())
+    }
+
+    fn ensure_chart(&self, f: &Frame) -> Result<()> {
+        let key = Self::chart_key(f);
+        {
+            let cache = self.chart.borrow();
+            if let Some(c) = cache.as_ref() {
+                if c.key == key {
+                    return Ok(());
+                }
+            }
+        }
+        let mut cache = self.chart.borrow_mut();
+        if cache.is_none() {
+            *cache = Some(self.new_chart_cache()?);
+        }
+        let c = cache.as_mut().unwrap();
+        self.build_chart(c, f)?;
+        c.key = key;
+        Ok(())
+    }
+
+    /// 静态卡片底：5 层玻璃 + 内发丝。软件 D2D 的 radial/linear 渐变全表面
+    /// 填充约 4–5 ms，缓存成位图后每帧只剩一次 DrawBitmap。
+    fn ensure_card_bg(&self, mix: usize) -> Result<()> {
+        if let Some(b) = self.card_bg.borrow().as_ref() {
+            if b.mix == mix {
+                return Ok(());
+            }
+        }
+        let mut cache = self.card_bg.borrow_mut();
+        if cache.is_none() {
+            let size = D2D_SIZE_F {
+                width: self.w,
+                height: self.h,
+            };
+            let target = unsafe {
+                self.rt.CreateCompatibleRenderTarget(
+                    Some(&size),
+                    None,
+                    None,
+                    D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,
+                )?
+            };
+            let bitmap = unsafe { target.GetBitmap()? };
+            *cache = Some(CardBg {
+                mix: usize::MAX,
+                target,
+                bitmap,
+            });
+        }
+        let b = cache.as_mut().unwrap();
+        let target = &b.target;
+        unsafe {
+            target.BeginDraw();
+            target.Clear(Some(&c(0, 0, 0, 0.0)));
+            target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            target.FillGeometry(&self.card_path, &self.glass[mix], None);
+            target.FillGeometry(&self.card_path, &self.b_hl1, None);
+            target.FillGeometry(&self.card_path, &self.b_hl2, None);
+            target.FillGeometry(&self.card_path, &self.b_blue, None);
+            target.FillGeometry(&self.card_path, &self.b_bottom, None);
+            target.DrawGeometry(&self.card_rim, &self.b_hair72, self.p(0.5), None);
+            target.DrawLine(
+                Vector2::new(self.p(card::RADIUS), self.p(0.25)),
+                Vector2::new(self.w - self.p(card::RADIUS), self.p(0.25)),
+                &self.b_hair85,
+                self.p(0.5),
+                None,
+            );
+            target.EndDraw(None, None)?;
+        }
+        b.bitmap = unsafe { target.GetBitmap()? };
+        b.mix = mix;
+        Ok(())
+    }
+
+    fn draw_card_bg(&self, mix: usize) -> Result<()> {
+        self.ensure_card_bg(mix)?;
+        let cache = self.card_bg.borrow();
+        let b = cache.as_ref().unwrap();
+        let dest = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: self.w,
+            bottom: self.h,
+        };
+        unsafe {
+            self.rt.DrawBitmap(
+                &b.bitmap,
+                Some(&dest),
+                1.0,
+                D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// 曲线：mask 已在重建时烘进位图，这里只做一次带统一 opacity 的合成。
+    fn draw_chart(&self, f: &Frame) -> Result<()> {
+        let alpha = f.hover_fx.chart_alpha;
+        if alpha <= 0.002 {
+            return Ok(());
+        }
+        self.ensure_chart(f)?;
+        let cache = self.chart.borrow();
+        let c = cache.as_ref().unwrap();
+        let (left, top, cw, ch) = self.chart_rect();
+        let dest = D2D_RECT_F {
+            left,
+            top,
+            right: left + cw,
+            bottom: top + ch,
+        };
+        unsafe {
+            self.rt.DrawBitmap(
+                &c.bitmap,
+                Some(&dest),
+                alpha,
+                D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    fn fit_feat(
+        &self,
+        text: &str,
+        fmt: &IDWriteTextFormat,
+        max_w: f32,
+        tracking: f32,
+    ) -> String {
+        if self.measure_feat(text, fmt, false, tracking) <= max_w {
+            return text.to_string();
+        }
+        let mut chars: Vec<char> = text.chars().collect();
+        while !chars.is_empty() {
+            chars.pop();
+            let candidate: String = chars.iter().collect::<String>() + "…";
+            if self.measure_feat(&candidate, fmt, false, tracking) <= max_w {
+                return candidate;
+            }
+        }
+        String::new()
+    }
+
+    /// 展开卡片：squircle 玻璃 + 排版 + 曲线 + hover 详情。
     pub fn paint(&self, f: &Frame) -> Result<()> {
         let w = self.w;
-        let h = self.h;
+        let fx = f.hover_fx;
 
         unsafe {
             self.rt.BeginDraw();
             self.rt.Clear(Some(&c(0, 0, 0, 0.0)));
             self.rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             self.rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        }
 
-            // 1. The glass body IS the ellipse: one antialiased fill, so the
-            //    alpha channel is exactly the shape and nothing else paints
-            //    outside it (verified by --selftest, which audits every pixel).
-            let body = D2D1_ELLIPSE {
-                point: Vector2::new(w / 2.0, h / 2.0),
-                radiusX: w / 2.0,
-                radiusY: h / 2.0,
-            };
-            let glass: &ID2D1LinearGradientBrush = if f.hover { &self.b_glass_hover } else { &self.b_glass };
-            self.rt.FillEllipse(&body, glass);
+        // 1. 玻璃 + 内发丝（缓存位图，只有 hover 亮度档变化才重画）。
+        let mix = (fx.glass.clamp(0.0, 1.0) * 8.0).round() as usize;
+        self.draw_card_bg(mix)?;
 
-            // 2. Text block.
-            let left = self.p(54.0);
-            let right = w - self.p(54.0);
-            let title_base = self.p(54.0);
-            let num_base = self.p(116.0);
-            let foot_base = self.p(146.0);
+        // 2. 曲线（在 .inner 下面）。
+        self.draw_chart(f)?;
 
-            self.draw_globe(left + self.p(6.3), title_base - self.p(4.6))?;
-            let x = left + self.p(19.0);
-            let title = self.fit(&f.title, &self.f_title, right - x - self.p(64.0));
-            let _ = self.draw_text(&title, &self.f_title, x, title_base, &self.b_ink)?;
+        // 3. 内容：整体随 hover 上浮 1px。
+        let dy = self.p(fx.inner_dy);
+        let left = self.p(card::PAD_X);
+        let right = w - self.p(card::PAD_X);
 
-            let sw = self.measure(&f.state, &self.f_state);
-            self.draw_text(&f.state, &self.f_state, right - sw, title_base, &self.b_ink2)?;
+        // .top：地球 + 标题 + 状态
+        let cy = self.p(card::TOP_Y + card::TOP_H / 2.0) + dy;
+        self.draw_globe(left + self.p(6.5), cy)?;
+        let state_w = self.measure_feat(&f.state, &self.f_state, false, self.p(0.022));
+        let title_x = left + self.p(19.0);
+        let title_max = (right - state_w - self.p(6.0) - title_x).min(self.p(150.0));
+        let title = self.fit_feat(&f.title, &self.f_title, title_max, self.p(-0.156));
+        self.draw_text_vcentered(
+            &self.rt,
+            &title,
+            &self.f_title,
+            title_x,
+            cy,
+            &self.b_ink,
+            false,
+            self.p(-0.156),
+        )?;
+        self.draw_text_vcentered(
+            &self.rt,
+            &f.state,
+            &self.f_state,
+            right - state_w,
+            cy,
+            &self.b_ink6,
+            false,
+            self.p(0.022),
+        )?;
 
-            let nw = self.draw_text(&f.down_value, &self.f_num, left, num_base, &self.b_ink)?;
-            self.draw_text(
-                &f.down_unit,
-                &self.f_unit,
-                left + nw + self.p(6.0),
-                num_base - self.p(1.0),
-                &self.b_ink3,
-            )?;
+        // .main：46px 大数字 + 单位 + 右侧上行。
+        let (lh_num, asc_num) = self.line_metrics("0", &self.f_num);
+        let num_base = self.p(card::MAIN_Y) + (self.p(card::MAIN_H) - lh_num) / 2.0 + asc_num + dy;
+        let nw = self.draw_baseline(
+            &f.down_value,
+            &self.f_num,
+            left,
+            num_base,
+            &self.b_ink,
+            true,
+            self.p(-1.932),
+        )?;
+        self.draw_baseline(
+            &f.down_unit,
+            &self.f_unit,
+            left + nw + self.p(5.0),
+            num_base,
+            &self.b_ink3,
+            false,
+            self.p(-0.065),
+        )?;
 
-            let uw = self.measure(&f.up_value, &self.f_up);
-            let uuw = self.measure(&f.up_unit, &self.f_upunit);
-            let unit_x = right - uuw;
-            self.draw_text(&f.up_unit, &self.f_upunit, unit_x, num_base - self.p(1.0), &self.b_ink3)?;
-            let val_x = unit_x - self.p(3.0) - uw;
-            self.draw_text(&f.up_value, &self.f_up, val_x, num_base - self.p(1.0), &self.b_ink2)?;
-            self.draw_up_arrow(val_x - self.p(12.5), num_base - self.p(1.0))?;
+        let (lh_up, asc_up) = self.line_metrics("0", &self.f_up);
+        let up_base = self.p(card::MAIN_Y + card::MAIN_H - 2.0) - (lh_up - asc_up) + dy;
+        let u2_w = self.measure_feat(&f.up_unit, &self.f_upunit, false, 0.0);
+        let u2_x = right - u2_w;
+        self.draw_baseline(
+            &f.up_unit,
+            &self.f_upunit,
+            u2_x,
+            up_base,
+            &self.b_ink3,
+            false,
+            0.0,
+        )?;
+        let up_w = self.measure_feat(&f.up_value, &self.f_up, true, 0.0);
+        let up_x = u2_x - self.p(4.0) - up_w;
+        self.draw_baseline(
+            &f.up_value,
+            &self.f_up,
+            up_x,
+            up_base,
+            &self.b_ink2,
+            true,
+            0.0,
+        )?;
+        self.draw_up_arrow(up_x - self.p(3.0) - self.p(9.0), up_base)?;
 
-            // 3. Foot row: Wi-Fi + proxy.
-            let fw = self.draw_text(&f.wifi, &self.f_foot, left, foot_base, &self.b_ink2)?;
-            self.draw_text(&f.proxy, &self.f_foot, left + fw + self.p(14.0), foot_base, &self.b_ink2)?;
-
-            // 4. Sparkline.
-            let cl = self.p(92.0);
-            let cr = w - self.p(92.0);
-            let ctop = self.p(154.0);
-            let cbase = self.p(186.0);
-            let flat = f.hist.iter().cloned().fold(0.0f64, f64::max) < 1024.0;
-            if flat {
-                self.rt.DrawLine(
-                    Vector2::new(cl, cbase),
-                    Vector2::new(cr, cbase),
-                    &self.b_base,
-                    self.p(0.7),
-                    None,
-                );
-            } else {
-                let (line, area) = self.spark_geometry(&f.hist, cl, cr, ctop + self.p(2.0), cbase)?;
-                self.b_area.SetStartPoint(Vector2::new(0.0, ctop));
-                self.b_area.SetEndPoint(Vector2::new(0.0, cbase));
-                self.rt.FillGeometry(&area, &self.b_area, None);
-                self.b_line.SetStartPoint(Vector2::new(cl, 0.0));
-                self.b_line.SetEndPoint(Vector2::new(cr, 0.0));
-                self.rt.DrawGeometry(&line, &self.b_line, self.p(1.5), &self.caps);
+        // .foot：Wi-Fi + 代理（hover 时淡出）。
+        let foot_alpha = fx.foot_alpha;
+        if foot_alpha > 0.002 {
+            let (lh_foot, _) = self.line_metrics("Wi-Fi", &self.f_foot);
+            let fcy = self.p(card::FOOT_Y) + lh_foot / 2.0 + dy;
+            for b in [&self.b_ink2, &self.b_ink3, &self.b_warn, &self.b_err] {
+                Self::set_alpha(b, foot_alpha);
             }
+            self.draw_wifi(left, fcy)?;
+            let mut x = left + self.p(15.0);
+            let w1 = self.draw_text_vcentered(
+                &self.rt,
+                "Wi-Fi",
+                &self.f_foot,
+                x,
+                fcy,
+                &self.b_ink2,
+                false,
+                self.p(0.044),
+            )?;
+            x += w1 + self.p(3.0);
+            let wifi_fmt = if f.wifi_ok { &self.f_foot_b } else { &self.f_foot };
+            x += self.draw_text_vcentered(
+                &self.rt,
+                &f.wifi,
+                wifi_fmt,
+                x,
+                fcy,
+                &self.b_ink2,
+                false,
+                0.0,
+            )?;
+            x += self.p(14.0);
+            self.draw_bolt(x, fcy)?;
+            x += self.p(15.0);
+            let w2 = self.draw_text_vcentered(
+                &self.rt,
+                "代理",
+                &self.f_foot,
+                x,
+                fcy,
+                &self.b_ink2,
+                false,
+                self.p(0.044),
+            )?;
+            x += w2 + self.p(3.0);
+            self.draw_text_vcentered(
+                &self.rt,
+                &f.proxy,
+                &self.f_foot_b,
+                x,
+                fcy,
+                self.tone_brush(f.proxy_tone),
+                false,
+                0.0,
+            )?;
+            for b in [&self.b_ink2, &self.b_ink3, &self.b_warn, &self.b_err] {
+                Self::set_alpha(b, 1.0);
+            }
+        }
 
-            // 5. Hairline rim: 0.5 logical px of white, sits on the AA edge.
-            let rim = D2D1_ELLIPSE {
-                point: Vector2::new(w / 2.0, h / 2.0),
-                radiusX: w / 2.0 - self.p(0.6),
-                radiusY: h / 2.0 - self.p(0.6),
-            };
-            self.rt.DrawEllipse(&rim, &self.b_white, self.p(0.6), None);
+        // .details：5 格错峰进场（3 行 × 2 列，第 5 格 span2）。
+        let container_alpha = fx.details_alpha;
+        if container_alpha > 0.002 {
+            let (lh_cell, asc_cell) = self.line_metrics("延迟", &self.f_cell);
+            let layout = card::details_layout(lh_cell / self.scale, asc_cell / self.scale);
+            let row_base = |i: usize| self.p(layout.baselines[i]) + dy + self.p(fx.details_dy);
+            let cells = fx.cells;
+            let gap = self.p(card::DETAILS_GAP_X);
+            let col_w = (right - left - gap) / 2.0;
+            for (i, row) in [(0usize, 0usize), (1, 0), (2, 1), (3, 1), (4, 2)] {
+                let cell = &f.details[i];
+                let alpha = container_alpha * cells[i].alpha;
+                if alpha <= 0.002 {
+                    continue;
+                }
+                let y = row_base(row) + self.p(cells[i].dy);
+                // 2 列 grid：偶数列左半、奇数列右半；span2 占满整行。
+                let (col_left, col_right) = if cell.span2 {
+                    (left, right)
+                } else if i % 2 == 0 {
+                    (left, left + col_w)
+                } else {
+                    (left + col_w + gap, right)
+                };
+                let value_w = self.measure_feat(&cell.value, &self.f_cell_val, true, self.p(-0.053));
+                let label_brush = &self.b_ink2;
+                let value_brush = self.tone_brush(cell.tone);
+                Self::set_alpha(label_brush, alpha);
+                Self::set_alpha(value_brush, alpha);
+                self.draw_baseline(&cell.label, &self.f_cell, col_left, y, label_brush, false, 0.0)?;
+                self.draw_baseline(
+                    &cell.value,
+                    &self.f_cell_val,
+                    col_right - value_w,
+                    y,
+                    value_brush,
+                    true,
+                    self.p(-0.053),
+                )?;
+                Self::set_alpha(label_brush, 1.0);
+                Self::set_alpha(value_brush, 1.0);
+            }
+            // span2 顶线（.5px rgba(18,21,26,.075)）。
+            let a = container_alpha * cells[4].alpha;
+            if a > 0.002 {
+                let y = self.p(layout.border_y) + dy + self.p(fx.details_dy + cells[4].dy);
+                Self::set_alpha(&self.b_base, a * 0.75);
+                unsafe {
+                    self.rt.DrawLine(
+                        Vector2::new(left, y),
+                        Vector2::new(right, y),
+                        &self.b_base,
+                        self.p(0.5),
+                        None,
+                    );
+                }
+                Self::set_alpha(&self.b_base, 1.0);
+            }
+        }
 
+        unsafe {
             self.rt.EndDraw(None, None)?;
         }
         Ok(())
@@ -1147,28 +1953,12 @@ impl Renderer {
         eprintln!("  layout(title)        {:.3} ms", t.elapsed().as_secs_f64() * 1000.0 / 200.0);
         let t = std::time::Instant::now();
         for _ in 0..200 { let _ = self.layout("2.9", &self.f_num)?; }
-        eprintln!("  layout(number 44px)  {:.3} ms", t.elapsed().as_secs_f64() * 1000.0 / 200.0);
+        eprintln!("  layout(number 46px)  {:.3} ms", t.elapsed().as_secs_f64() * 1000.0 / 200.0);
         let t = std::time::Instant::now();
-        for _ in 0..200 { let _ = self.spark_geometry(&f.hist, 0.0, 300.0, 0.0, 40.0)?; }
+        let (cw, ch) = self.chart_size();
+        for _ in 0..200 { let _ = self.spark_geometry(&f.hist, 0.0, cw, 8.0, ch - 10.0, ch)?; }
         eprintln!("  spark geometry       {:.3} ms", t.elapsed().as_secs_f64() * 1000.0 / 200.0);
         Ok(())
-    }
-
-    /// Truncates with an ellipsis so a long interface alias can never paint
-    /// past the ellipse.
-    fn fit(&self, text: &str, fmt: &IDWriteTextFormat, max_w: f32) -> String {
-        if self.measure(text, fmt) <= max_w {
-            return text.to_string();
-        }
-        let mut chars: Vec<char> = text.chars().collect();
-        while !chars.is_empty() {
-            chars.pop();
-            let candidate: String = chars.iter().collect::<String>() + "…";
-            if self.measure(&candidate, fmt) <= max_w {
-                return candidate;
-            }
-        }
-        String::new()
     }
 
     pub fn dimensions(&self) -> (f32, f32) {
