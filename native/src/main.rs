@@ -16,6 +16,9 @@
 //!   --selftest             render offscreen, report DIB alpha inside/outside the shape
 
 mod anim;
+mod card;
+mod font;
+mod fx;
 mod island;
 mod mode;
 mod netmon;
