@@ -526,6 +526,65 @@ impl Renderer {
         Ok(())
     }
 
+    /// 岛态（T2 粗糙版）：一条圆角胶囊 + 下行速率文字。
+    /// 视觉复刻在 T3（呼吸灯、迷你数字、hover 放大）完成，这里只要三态可辨。
+    pub fn paint_island(&self, f: &Frame) -> Result<()> {
+        let w = self.w;
+        let h = self.h;
+        unsafe {
+            self.rt.BeginDraw();
+            self.rt.Clear(Some(&c(0, 0, 0, 0.0)));
+            self.rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            self.rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+
+            let radius = h / 2.0;
+            let body = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: 0.0,
+                    top: 0.0,
+                    right: w,
+                    bottom: h,
+                },
+                radiusX: radius,
+                radiusY: radius,
+            };
+            let glass: &ID2D1LinearGradientBrush = if f.hover { &self.b_glass_hover } else { &self.b_glass };
+            self.rt.FillRoundedRectangle(&body, glass);
+
+            // 静态呼吸点：DC 行为，不逐帧出帧（D1 的视觉换功耗）。
+            let dot = D2D1_ELLIPSE {
+                point: Vector2::new(self.p(13.0), h / 2.0),
+                radiusX: self.p(3.2),
+                radiusY: self.p(3.2),
+            };
+            self.rt.FillEllipse(&dot, &self.b_line);
+
+            let text = format!("↓ {} {}", f.down_value, f.down_unit);
+            let tw = self.measure(&text, &self.f_foot);
+            self.draw_text(
+                &text,
+                &self.f_foot,
+                w - self.p(13.0) - tw,
+                h / 2.0 + self.p(4.0),
+                &self.b_ink,
+            )?;
+
+            let rim = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: self.p(0.5),
+                    top: self.p(0.5),
+                    right: w - self.p(0.5),
+                    bottom: h - self.p(0.5),
+                },
+                radiusX: radius,
+                radiusY: radius,
+            };
+            self.rt.DrawRoundedRectangle(&rim, &self.b_white, self.p(0.6), None);
+            self.rt.EndDraw(None, None)?;
+        }
+        Ok(())
+    }
+
     /// Micro-benchmark hook used by `--bench` to attribute paint cost.
     pub fn bench_parts(&self, f: &Frame) -> Result<()> {
         let t = std::time::Instant::now();

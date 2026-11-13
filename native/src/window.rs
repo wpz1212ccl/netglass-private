@@ -77,6 +77,13 @@ impl Surface {
     }
 
     pub fn present(&self, x: i32, y: i32) -> Result<()> {
+        self.present_rect(x, y, self.w, self.h)
+    }
+
+    /// ULW 的 pptDst + psize 可以逐帧改位置与尺寸，形变因此不需要 SetWindowPos，
+    /// 也不会和窗口 resize 抢主线程（spec §2 D8）。源 DIB 仍是整张画布，
+    /// 中间帧靠 ULW 缩放降级——T5 才换成"纯形状重绘 + 重建 DIB 尺寸"。
+    pub fn present_rect(&self, x: i32, y: i32, w: i32, h: i32) -> Result<()> {
         let hwnd = match self.hwnd {
             Some(h) => h,
             None => return Ok(()),
@@ -84,8 +91,8 @@ impl Surface {
         unsafe {
             let dst = POINT { x, y };
             let size = SIZE {
-                cx: self.w,
-                cy: self.h,
+                cx: w.max(1),
+                cy: h.max(1),
             };
             let src = POINT { x: 0, y: 0 };
             let blend = BLENDFUNCTION {
@@ -145,6 +152,8 @@ pub struct WindowConfig {
     pub y: i32,
     pub w: i32,
     pub h: i32,
+    /// false 时创建即隐藏（`--silent` 自启动不显窗）。
+    pub visible: bool,
 }
 
 pub fn create_window(cfg: &WindowConfig, proc: WNDPROC) -> Result<HWND> {
@@ -164,11 +173,16 @@ pub fn create_window(cfg: &WindowConfig, proc: WNDPROC) -> Result<HWND> {
             lpszClassName: PCWSTR(cls.as_ptr()),
         };
         let _ = RegisterClassW(&wc);
+        let style = if cfg.visible {
+            WS_POPUP | WS_VISIBLE
+        } else {
+            WS_POPUP
+        };
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
             PCWSTR(cls.as_ptr()),
             PCWSTR(wide("NetGlass Native").as_ptr()),
-            WS_POPUP | WS_VISIBLE,
+            style,
             cfg.x,
             cfg.y,
             cfg.w,
@@ -263,9 +277,17 @@ pub fn parse_points(args: &[String], flag: &str) -> Vec<(i32, i32)> {
 }
 
 pub const WM_APP_SAMPLE: u32 = 0x8000 + 1;
+/// 形态线程 → UI 线程：形态变了（wparam = mode_code）。
+pub const WM_APP_MODE: u32 = 0x8000 + 2;
+/// 几何线程 → UI 线程：形变中间帧（矩形从 `pending_geometry` 取）。
+pub const WM_APP_GEOMETRY: u32 = 0x8000 + 3;
+
+pub fn post(raw: isize, msg: u32) {
+    unsafe {
+        let _ = PostMessageW(Some(HWND(raw as *mut c_void)), msg, WPARAM(0), LPARAM(0));
+    }
+}
 
 pub fn post_sample(raw: isize) {
-    unsafe {
-        let _ = PostMessageW(Some(HWND(raw as *mut c_void)), WM_APP_SAMPLE, WPARAM(0), LPARAM(0));
-    }
+    post(raw, WM_APP_SAMPLE);
 }

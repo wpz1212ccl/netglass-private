@@ -184,6 +184,7 @@ pub fn primary_index(connected: &[u32]) -> Option<u32> {
 }
 
 /// 调试用：把所有接口行原样写进临时目录，便于核对状态字段。
+#[cfg(debug_assertions)]
 pub fn dump() {
     let mut out = String::new();
     unsafe {
@@ -269,7 +270,7 @@ impl Sampler {
         }
     }
 
-    pub fn sample(&mut self) -> Sample {
+    pub fn sample(&mut self, full: bool) -> Sample {
         let now = Instant::now();
 
         // 接口表 60 秒重建一次：接口增删/重播远比这慢，
@@ -316,6 +317,20 @@ impl Sampler {
             self.last_primary = Some(now);
         }
         let primary = self.primary;
+
+        if !full {
+            // 隐藏态只维护计数差分，不构建载荷：省每秒的 Vec/String 分配
+            return Sample {
+                ts: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                primary_id: primary,
+                total_down: 0.0,
+                total_up: 0.0,
+                ifaces: Vec::new(),
+            };
+        }
 
         let mut ifaces = Vec::with_capacity(rows.len());
         for (idx, in_octets, out_octets, is_up, link_bps) in rows {

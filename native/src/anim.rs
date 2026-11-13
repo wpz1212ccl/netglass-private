@@ -1,0 +1,321 @@
+//! 弹簧驱动的窗口几何动画（灵动岛 <-> 卡片）。
+//!
+//! 形变的对象就是窗口矩形本身：过渡期间内容全部淡出，窗口里只剩圆角
+//! 背景，所以这里用独立线程推进弹簧，每帧把矩形交给调用方（native 版是
+//! `Surface::present_at`，不再 SetWindowPos）。窗口宽度/中心/高度各自一条
+//! 阻尼弹簧，目标可随时打断重定向，位置与速度连续，因此快速点击/切前台
+//! 不会看到跳变。
+//!
+//! 从 `src-tauri/src/anim.rs` 原样移植：弹簧与打断逻辑一字未改，只把
+//! 「HWND + GetWindowRect/SetWindowPos」换成注入的 `Target`，因此本模块
+//! 零 Win32 依赖、可单测。
+
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl Rect {
+    pub const fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
+        Self { x, y, w, h }
+    }
+    fn cx(self) -> f64 {
+        self.x as f64 + self.w as f64 / 2.0
+    }
+}
+
+/// response = 无阻尼周期（秒级），damping = 阻尼比。
+/// damping < 1 才有回弹；越大越"稳重"。
+/// delay_ms = 起步前的停顿：制造"先慢后快"的节奏（内容先退场，形状再起步）。
+#[derive(Clone, Copy, Debug)]
+pub struct Motion {
+    pub response: f64,
+    pub damping: f64,
+    pub delay_ms: u64,
+}
+
+impl Motion {
+    pub const fn new(response: f64, damping: f64) -> Self {
+        Self {
+            response,
+            damping,
+            delay_ms: 0,
+        }
+    }
+    pub const fn delayed(response: f64, damping: f64, delay_ms: u64) -> Self {
+        Self {
+            response,
+            damping,
+            delay_ms,
+        }
+    }
+}
+
+/// 几何的去处。`apply` 每帧收到一个新矩形；`current` 在动画从空闲被唤醒时
+/// 读一次真实矩形（用户可能刚拖动过窗口），避免从旧位置弹过去。
+pub struct Target {
+    pub apply: Box<dyn Fn(Rect) + Send>,
+    pub current: Box<dyn Fn() -> Option<Rect> + Send>,
+}
+
+struct Command {
+    rect: Rect,
+    motion: Motion,
+    snap: bool,
+}
+
+static TX: OnceLock<Sender<Command>> = OnceLock::new();
+
+pub fn start(target: Target, initial: Rect) {
+    let (tx, rx) = mpsc::channel();
+    let _ = TX.set(tx);
+    let _ = std::thread::Builder::new()
+        .name("netglass-geometry".into())
+        .spawn(move || run(target, initial, rx));
+}
+
+pub fn animate_to(rect: Rect, motion: Motion) {
+    if let Some(tx) = TX.get() {
+        let _ = tx.send(Command { rect, motion, snap: false });
+    }
+}
+
+/// 不播动画，直接把窗口摆到目标（显示隐藏窗口、启动时用）。
+pub fn snap_to(rect: Rect) {
+    if let Some(tx) = TX.get() {
+        let _ = tx.send(Command { rect, motion: Motion::new(0.3, 1.0), snap: true });
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Spring {
+    pos: f64,
+    vel: f64,
+    target: f64,
+}
+
+impl Spring {
+    fn new(v: f64) -> Self {
+        Self { pos: v, vel: 0.0, target: v }
+    }
+    fn set(&mut self, v: f64) {
+        self.pos = v;
+        self.vel = 0.0;
+        self.target = v;
+    }
+    fn retarget(&mut self, v: f64) {
+        self.target = v;
+    }
+    fn step(&mut self, dt: f64, omega: f64, zeta: f64) {
+        let acc = -omega * omega * (self.pos - self.target) - 2.0 * zeta * omega * self.vel;
+        self.vel += acc * dt;
+        self.pos += self.vel * dt;
+    }
+    fn settled(&self) -> bool {
+        (self.pos - self.target).abs() < 0.6 && self.vel.abs() < 12.0
+    }
+}
+
+struct Geometry {
+    cx: Spring,
+    w: Spring,
+    y: Spring,
+    h: Spring,
+}
+
+impl Geometry {
+    fn from_rect(r: Rect) -> Self {
+        Self {
+            cx: Spring::new(r.cx()),
+            w: Spring::new(r.w as f64),
+            y: Spring::new(r.y as f64),
+            h: Spring::new(r.h as f64),
+        }
+    }
+    fn set(&mut self, r: Rect) {
+        self.cx.set(r.cx());
+        self.w.set(r.w as f64);
+        self.y.set(r.y as f64);
+        self.h.set(r.h as f64);
+    }
+    fn retarget(&mut self, r: Rect) {
+        self.cx.retarget(r.cx());
+        self.w.retarget(r.w as f64);
+        self.y.retarget(r.y as f64);
+        self.h.retarget(r.h as f64);
+    }
+    fn step(&mut self, dt: f64, m: Motion) {
+        let omega = std::f64::consts::TAU / m.response.max(0.05);
+        let zeta = m.damping.clamp(0.2, 1.2);
+        // 上边缘比形状略慢半拍：展开时先向下长、再整体落位，
+        // 收起时先压高度、最后把顶边收回，避免"整块矩形平移"的呆板感。
+        let (oy, zy) = (
+            std::f64::consts::TAU / (m.response * 1.18).max(0.05),
+            (m.damping + 0.04).clamp(0.2, 1.2),
+        );
+        self.cx.step(dt, omega, zeta);
+        self.w.step(dt, omega, zeta);
+        self.y.step(dt, oy, zy);
+        self.h.step(dt, omega, zeta);
+    }
+    fn settled(&self) -> bool {
+        self.cx.settled() && self.w.settled() && self.y.settled() && self.h.settled()
+    }
+    fn rect(&self) -> Rect {
+        let w = self.w.pos.round().max(1.0) as i32;
+        let h = self.h.pos.round().max(1.0) as i32;
+        let x = (self.cx.pos - self.w.pos / 2.0).round() as i32;
+        Rect::new(x, self.y.pos.round() as i32, w, h)
+    }
+}
+
+fn run(target: Target, initial: Rect, rx: Receiver<Command>) {
+    let mut geom = Geometry::from_rect(initial);
+    let mut motion = Motion::new(0.36, 0.86);
+    let mut target_rect = initial;
+    let mut last = (target.current)().unwrap_or(initial);
+    let mut idle = true;
+    let mut last_tick = Instant::now();
+    let mut delay_until: Option<Instant> = None;
+
+    loop {
+        let cmd = if idle {
+            // 空闲时零开销阻塞，不再周期性唤醒
+            match rx.recv() {
+                Ok(c) => Some(c),
+                Err(_) => return,
+            }
+        } else {
+            match rx.recv_timeout(Duration::from_millis(8)) {
+                Ok(c) => Some(c),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        };
+
+        if let Some(c) = cmd {
+            let was_idle = idle;
+            if was_idle {
+                // 用户可能刚拖动过窗口：以真实矩形重新起算，避免从旧位置弹过去
+                if let Some(actual) = (target.current)() {
+                    geom = Geometry::from_rect(actual);
+                    last = actual;
+                }
+            }
+            motion = c.motion;
+            target_rect = c.rect;
+            if c.snap {
+                geom.set(c.rect);
+                (target.apply)(geom.rect());
+                last = geom.rect();
+                idle = true;
+                delay_until = None;
+                continue;
+            }
+            // 打断时保留当前速度，实现"从当前帧自然接上"
+            geom.retarget(c.rect);
+            idle = false;
+            // 只有从静止开始的完整动作才吃 delay；打断/接力立即起步
+            let delay = if was_idle { c.motion.delay_ms } else { 0 };
+            delay_until = if delay > 0 {
+                Some(Instant::now() + Duration::from_millis(delay))
+            } else {
+                None
+            };
+            last_tick = delay_until.unwrap_or_else(Instant::now);
+        }
+
+        if idle {
+            continue;
+        }
+
+        let now = Instant::now();
+        if let Some(until) = delay_until {
+            if now < until {
+                last_tick = now;
+                continue;
+            }
+            delay_until = None;
+            last_tick = until;
+        }
+        // 上游每帧都要重建 DIB 尺寸并 present，物理用固定 4ms 子步，
+        // 保证大 dt 下也不会把回弹"积"成过阻尼。
+        let dt = (now - last_tick).as_secs_f64().clamp(0.001, 0.05);
+        last_tick = now;
+        let mut remain = dt;
+        while remain > 0.0 {
+            let h = remain.min(0.004);
+            geom.step(h, motion);
+            remain -= h;
+        }
+        if geom.settled() {
+            geom.set(target_rect);
+        }
+        let r = geom.rect();
+        if r != last {
+            (target.apply)(r);
+            last = r;
+        }
+        if geom.settled() {
+            idle = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn motion(dead: f64) -> Motion {
+        Motion::new(dead, 1.0)
+    }
+
+    #[test]
+    fn settled_geometry_reports_target_rect() {
+        let mut g = Geometry::from_rect(Rect::new(100, 200, 400, 300));
+        g.retarget(Rect::new(500, 600, 200, 100));
+        for _ in 0..2000 {
+            g.step(0.004, motion(0.30));
+        }
+        assert!(g.settled(), "无阻尼欠阻尼以外的 zeta=1 应当收敛");
+        assert_eq!(g.rect(), Rect::new(500, 600, 200, 100));
+    }
+
+    #[test]
+    fn spring_keeps_velocity_when_retargeted() {
+        // 形变中途改目标：速度不清零，位置连续（不回跳到起点）
+        let mut g = Geometry::from_rect(Rect::new(0, 0, 400, 300));
+        g.retarget(Rect::new(1000, 0, 400, 300));
+        for _ in 0..10 {
+            g.step(0.004, motion(0.30));
+        }
+        let mid = g.rect();
+        assert!(mid.x > 0 && mid.x < 1000, "形变中途应在两端之间：{mid:?}");
+        g.retarget(Rect::new(-1000, 0, 400, 300));
+        let before = g.rect();
+        g.step(0.004, motion(0.30));
+        let after = g.rect();
+        assert!(
+            (after.x as f64 - before.x as f64).abs() < 200.0,
+            "反向重定向后不应瞬移：{before:?} -> {after:?}"
+        );
+    }
+
+    #[test]
+    fn rect_never_collapses_below_one_pixel() {
+        let mut g = Geometry::from_rect(Rect::new(0, 0, 400, 300));
+        g.retarget(Rect::new(0, 0, 0, 0));
+        for _ in 0..2000 {
+            g.step(0.004, motion(0.30));
+        }
+        let r = g.rect();
+        assert!(r.w >= 1 && r.h >= 1, "{r:?}");
+    }
+}
