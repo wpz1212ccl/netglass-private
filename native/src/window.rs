@@ -99,40 +99,21 @@ impl Surface {
     }
 
     /// ULW 的 pptDst + psize 可以逐帧改位置与尺寸，形变因此不需要 SetWindowPos，
-    /// 也不会和窗口 resize 抢主线程（spec §2 D8）。源 DIB 仍是整张画布，
-    /// 中间帧靠 ULW 缩放降级——T5 才换成"纯形状重绘 + 重建 DIB 尺寸"。
+    /// 也不会和窗口 resize 抢主线程（spec §2 D8）。
+    ///
+    /// 源图取 `pptSrc=(0,0)` 起的 psize 区域：DIB 比 psize 大时是 1:1 裁切、
+    /// **不缩放**，所以形变帧必须按当前矩形重画（T5 的 `render::ShapePainter`），
+    /// 不能拿整张卡片的位图去缩——那会把文字拉花。
     pub fn present_rect(&self, x: i32, y: i32, w: i32, h: i32) -> Result<()> {
-        let hwnd = match self.hwnd {
-            Some(h) => h,
-            None => return Ok(()),
-        };
-        unsafe {
-            let dst = POINT { x, y };
-            let size = SIZE {
-                cx: w.max(1),
-                cy: h.max(1),
-            };
-            let src = POINT { x: 0, y: 0 };
-            let blend = BLENDFUNCTION {
-                BlendOp: 0, // AC_SRC_OVER
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: 1, // AC_SRC_ALPHA
-            };
-            // 每帧 GetDC/ReleaseDC 是可见开销（15 fps 呼吸）；缓存屏幕 DC。
-            let screen = screen_dc();
-            let r = UpdateLayeredWindow(
-                hwnd,
-                Some(screen),
-                Some(&dst),
-                Some(&size),
-                Some(self.mem_dc),
-                Some(&src),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
-            r
+        self.present_rect_alpha(x, y, w, h, 255)
+    }
+
+    /// 带全局不透明度的呈现：`.card.out` 的 220 ms 淡出/淡入用
+    /// `BLENDFUNCTION::SourceConstantAlpha` 实现，不必重画内容。
+    pub fn present_rect_alpha(&self, x: i32, y: i32, w: i32, h: i32, alpha: u8) -> Result<()> {
+        match self.hwnd {
+            Some(hwnd) => present_dc(hwnd, self.mem_dc, x, y, w, h, alpha),
+            None => Ok(()),
         }
     }
 
@@ -162,6 +143,37 @@ impl Drop for Surface {
             let _ = DeleteObject(HGDIOBJ(self.dib.0));
             let _ = DeleteDC(self.mem_dc);
         }
+    }
+}
+
+/// 把任意 32bpp premultiplied DIB 的 DC 贴到 layered window 上（形变帧共用）。
+pub fn present_dc(hwnd: HWND, src_dc: HDC, x: i32, y: i32, w: i32, h: i32, alpha: u8) -> Result<()> {
+    unsafe {
+        let dst = POINT { x, y };
+        let size = SIZE {
+            cx: w.max(1),
+            cy: h.max(1),
+        };
+        let src = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: 0, // AC_SRC_OVER
+            BlendFlags: 0,
+            SourceConstantAlpha: alpha,
+            AlphaFormat: 1, // AC_SRC_ALPHA
+        };
+        // 每帧 GetDC/ReleaseDC 是可见开销（15 fps 呼吸）；缓存屏幕 DC。
+        let screen = screen_dc();
+        UpdateLayeredWindow(
+            hwnd,
+            Some(screen),
+            Some(&dst),
+            Some(&size),
+            Some(src_dc),
+            Some(&src),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        )
     }
 }
 

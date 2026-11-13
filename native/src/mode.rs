@@ -281,6 +281,29 @@ pub fn motion_for(mode: UiMode) -> anim::Motion {
     }
 }
 
+/// 点击胶囊展开后保持多久（对照 `expand_temporarily` 的 8 s）。
+pub const PIN_SECS: u64 = 8;
+
+/// 手动展开是否仍然有效（`expand_temporarily` 的 8 秒 pin）。
+///
+/// 原版语义：pin 期内前台窗口**还是当时那个**（或不是应用窗口，比如桌面/
+/// 任务栏）才保持展开；一旦用户切到别的应用，pin 立即失效。
+pub fn pinned_here(
+    pin_until: Option<Instant>,
+    now: Instant,
+    pin_fg: isize,
+    fg: isize,
+    kind: FgKind,
+) -> bool {
+    let Some(until) = pin_until else {
+        return false;
+    };
+    if now >= until {
+        return false;
+    }
+    kind != FgKind::App || (pin_fg != 0 && pin_fg == fg)
+}
+
 /// `--silent` 自启动：桌面稳定到展开之前不显窗（P1-3）。
 /// 一旦显示过，`silent_pending` 由调用方清零，之后三态照常。
 pub fn show_on_decide(mode: UiMode, silent_pending: bool) -> bool {
@@ -681,5 +704,51 @@ mod tests {
         assert!(!show_on_decide(UiMode::Island, true), "静默启动不先露胶囊");
         assert!(show_on_decide(UiMode::Expanded, true), "桌面稳定 2s 才展开");
         assert!(show_on_decide(UiMode::Island, false), "显示过后三态照常");
+    }
+
+    // ---- T5：点击胶囊展开的 8 秒 pin ----
+
+    #[test]
+    fn pin_holds_expanded_for_eight_seconds() {
+        let t0 = Instant::now();
+        let until = Some(t0 + Duration::from_secs(PIN_SECS));
+        assert!(pinned_here(until, t0, 42, 42, FgKind::App), "同一前台窗口保持展开");
+        assert!(pinned_here(until, t0, 42, 0, FgKind::Desktop), "桌面也保持");
+        assert!(pinned_here(until, t0, 42, 0, FgKind::ShellTransient), "任务栏路过也保持");
+        assert!(
+            !pinned_here(until, t0, 42, 99, FgKind::App),
+            "切到别的应用立即失效"
+        );
+        assert!(!pinned_here(until, t0 + Duration::from_secs(8), 42, 42, FgKind::App), "8 秒后失效");
+        assert!(!pinned_here(None, t0, 42, 42, FgKind::App), "没有 pin 就是 false");
+    }
+
+    #[test]
+    fn pin_prevents_desktop_settle_from_being_needed() {
+        // 点胶囊（前台是应用）→ 立即展开；pin 期内即使计时器没跑也保持展开
+        let t0 = Instant::now();
+        let mut g = ModeGate::new();
+        let until = Some(t0 + Duration::from_secs(PIN_SECS));
+        for i in 0..10 {
+            let now = t0 + TICK * i;
+            let m = g.decide(
+                now,
+                FgSnapshot {
+                    pinned_here: pinned_here(until, now, 42, 42, FgKind::App),
+                    ..snap(FgKind::App)
+                },
+            );
+            assert_eq!(m, UiMode::Expanded, "pin 期内应保持展开：{i}");
+        }
+        // pin 结束后回到普通应用 → 收回胶囊
+        let now = t0 + Duration::from_secs(PIN_SECS + 1);
+        let m = g.decide(
+            now,
+            FgSnapshot {
+                pinned_here: pinned_here(until, now, 42, 42, FgKind::App),
+                ..snap(FgKind::App)
+            },
+        );
+        assert_eq!(m, UiMode::Island);
     }
 }
