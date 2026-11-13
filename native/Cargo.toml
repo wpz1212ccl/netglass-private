@@ -13,6 +13,10 @@ windows-numerics = "0.3"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    # T6 托盘图标：内嵌 PNG 用系统 WIC 解码（同一 windows 依赖加 feature，
+    # 非新增三方 crate —— D10）。
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_DirectWrite",
@@ -21,11 +25,17 @@ windows = { version = "0.62.2", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    # T6：CreateMutexW / RegCreateKeyExW 的安全属性参数需要这个 feature。
+    "Win32_Security",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Power",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
+    # T6：HKCU Run 自启（RegSetValueExW）。
+    "Win32_System_Registry",
+    # T6：托盘 Shell_NotifyIconW + 单实例 CreateMutexW 的唤醒消息。
+    "Win32_UI_Shell",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

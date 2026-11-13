@@ -18,19 +18,31 @@
 //!   --morph-frame MS       定格形变中间帧（配 --morph-dir=expand|collapse 取证）
 //!   --morph-demo           诊断：真实 apply_mode 路径上交替展开/收回（几何连续性取证）
 //!   --show-after MS        诊断：起手隐藏，MS 后走真实路径显示初始形态（恢复首帧取证）
+//!   --dpi-test DPI         诊断：1.5 s 后投递一次 DPI 变化（跨屏重建取证）
+//!
+//! 系统集成（T6，纯 Win32 零新增三方 crate）：
+//!   托盘（`tray.rs` + `menu.rs`）、全局快捷键（`hotkey.rs`）、锁定（`lock.rs`）、
+//!   自启（`autostart.rs`）、config.json（`config.rs`）、单实例（`instance.rs`）。
 
 mod anim;
+mod autostart;
 mod card;
+mod config;
 mod font;
 mod fx;
+mod hotkey;
 mod input;
+mod instance;
 mod island;
+mod lock;
+mod menu;
 mod mode;
 mod morph;
 mod number;
 mod netmon;
 mod probe;
 mod render;
+mod tray;
 mod window;
 
 use std::cell::RefCell;
@@ -42,7 +54,8 @@ use std::time::{Duration, Instant};
 use windows::core::Result;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    RegisterHotKey, ReleaseCapture, SetCapture, TrackMouseEvent, UnregisterHotKey, TME_LEAVE,
+    TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -66,6 +79,8 @@ const TIMER_FADE: usize = 4;
 const TIMER_MORPH: usize = 5;
 /// 形变保险丝：弹簧异常时也必须收尾，不能卡在中间帧。
 const MORPH_TIMEOUT_MS: u64 = 2000;
+/// 全局快捷键 id（`RegisterHotKey`/`WM_HOTKEY` 共用）。
+const HOTKEY_ID: i32 = 1;
 
 /// 实际显示形态。apply_mode 维护；形态线程写、UI 线程读。
 static MODE: AtomicU8 = AtomicU8::new(0);
@@ -78,6 +93,18 @@ static PIN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 static PIN_FG: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 /// 双击收回后的手动胶囊态（对照 `MANUAL_ISLAND`）：压过桌面 2 s settle。
 static MANUAL_ISLAND: AtomicU8 = AtomicU8::new(0);
+/// D6：托盘手动隐藏。形态线程读它写进 `ModeGate`，全屏路过/退出全屏都不重显。
+static MANUAL_HIDDEN: AtomicU8 = AtomicU8::new(0);
+/// 跨屏 DPI 变化后的新布局（UI 线程在 `WM_DPICHANGED` 里写，形态线程每拍取走）。
+/// 形态线程持有自己的 `Layout` 副本，不跟着换就会按旧缩放把窗口弹回旧尺寸。
+static DPI_UPDATE: Mutex<Option<DpiUpdate>> = Mutex::new(None);
+
+#[derive(Clone, Copy)]
+struct DpiUpdate {
+    scale: f32,
+    screen: anim::Rect,
+    home: (i32, i32),
+}
 
 /// 几何线程待呈现的矩形（UI 线程在 WM_APP_GEOMETRY 里取走）。
 static PENDING: Mutex<Option<anim::Rect>> = Mutex::new(None);
@@ -142,6 +169,32 @@ fn main() {
             eprintln!("morph-frame failed: {e:?}");
             std::process::exit(1);
         }
+        return;
+    }
+    // T6 诊断：托盘图标解码 / 自启注册表通路（都在临时资源上，不碰用户状态）。
+    if args.iter().any(|a| a == "--icon") {
+        tray::dump_icon();
+        return;
+    }
+    if args.iter().any(|a| a == "--autostart-selftest") {
+        let ok = autostart::selftest();
+        println!("autostart selftest: {}", if ok { "PASS" } else { "FAIL" });
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--tray-menu") {
+        // 菜单结构自证：真的建一个 Win32 菜单再读回来（不需要点托盘图标）。
+        let hotkey = hotkey::pick(|_| true);
+        let on = autostart::is_enabled();
+        println!("hotkey={:?} autostart={on}", hotkey.map(|h| h.label));
+        tray::dump_menu(&menu::items(hotkey, on));
+        return;
+    }
+    if args.iter().any(|a| a == "--config") {
+        println!("path={:?}", config::path());
+        println!("{}", config::to_pretty(&config::load()));
         return;
     }
     if let Err(e) = run(&args) {
@@ -245,6 +298,15 @@ struct App {
     /// 按下起点与当前矩形（拖动阈值 / 点击判定）。
     press: Option<(POINT, i32, i32)>,
     press_moved: bool,
+
+    /// 锁定态（P4-2）：写 `WS_EX_TRANSPARENT`，并写回 config.json。
+    locked: lock::Lock,
+    /// 实际注册到的快捷键（菜单文案要用它的名字）。
+    hotkey: Option<&'static hotkey::Hotkey>,
+    /// 自启当前是否已写入注册表（菜单勾选态的唯一来源）。
+    autostart_on: bool,
+    /// 最近一次真正显示过的形态（隐藏前的），托盘重新显示时还原它。
+    last_shown: mode::UiMode,
 }
 
 /// 一次形变：起点/终点矩形 + 形状弹簧与内容时间轴。
@@ -293,7 +355,8 @@ impl App {
         let now_ms = self.hover_t0.elapsed().as_secs_f64() * 1000.0;
         render::Frame {
             title: self.title.clone(),
-            state: self.state.clone(),
+            // 现版前端把锁定状态拼在连接状态后面（`index.html:478`）。
+            state: lock::state_text(&self.state, self.locked.is_on()),
             down_value: self.down.0.clone(),
             down_unit: self.down.1.clone(),
             up_value: self.up.0.clone(),
@@ -505,6 +568,8 @@ impl App {
             return;
         };
         let was_hidden = !self.visible;
+        // 隐藏前的形态：托盘"显示"时还原它（现版 LAST_SHOWN 语义）。
+        self.last_shown = m;
         // MODE 立刻更新（形态线程据此判"已应用"，不再重复派发）；
         // `applied` 留到收尾才切——形变中间帧要按**旧形态**的内容淡出。
         MODE.store(code, Ordering::Relaxed);
@@ -686,7 +751,6 @@ impl App {
     }
 
     /// 左键单击（未拖动）：双击 = 卡片收回胶囊；胶囊单击 = 展开 8 秒。
-    ///
     /// 对照前端：`dblclick` → `collapse_to_island`、`.mini` click →
     /// `expand_temporarily`。窗口没有 CS_DBLCLKS，双击由 `input` 自己数。
     fn on_click(&mut self) {
@@ -1068,6 +1132,237 @@ impl App {
             self.sync_num_timer();
         }
     }
+
+    // ---- T6 系统集成 ----------------------------------------------------
+
+    /// 托盘菜单选中一项后的动作（菜单已经关掉，可以安全持 APP 借用）。
+    fn on_menu_action(&mut self, action: menu::MenuAction) {
+        match action {
+            menu::MenuAction::ToggleVisible => self.toggle_visible(),
+            menu::MenuAction::ToggleLock => self.toggle_lock(),
+            menu::MenuAction::ToggleAutostart => self.toggle_autostart(),
+            menu::MenuAction::Quit => unsafe {
+                let _ = DestroyWindow(self.hwnd);
+            },
+        }
+    }
+
+    /// 第二实例唤起：显示自己并按当前形态重新落位（不改变三态决策）。
+    fn wake_from_second_instance(&mut self) {
+        log_line("second instance: wake");
+        MANUAL_HIDDEN.store(0, Ordering::Relaxed);
+        let m = if self.visible {
+            self.effective_mode()
+        } else {
+            self.last_shown
+        };
+        if !self.visible {
+            MODE.store(mode::mode_code(m), Ordering::Relaxed);
+            self.apply_mode(m);
+        }
+        if let Some(target) = self.layout.target(m) {
+            // 只做置顶与非激活显示：用户按了第二次，应当看到窗口。
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNA);
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOPMOST),
+                    target.x,
+                    target.y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
+    /// 托盘「显示 / 隐藏」（也用于左键单击）：与现版 `toggle_visible` 同语义。
+    fn toggle_visible(&mut self) {
+        if self.visible {
+            MANUAL_HIDDEN.store(1, Ordering::Relaxed);
+            if self.current_mode() != mode::UiMode::Hidden {
+                MODE.store(mode::mode_code(mode::UiMode::Hidden), Ordering::Relaxed);
+                self.apply_mode(mode::UiMode::Hidden);
+            }
+        } else {
+            MANUAL_HIDDEN.store(0, Ordering::Relaxed);
+            // 还原到"最后显示过的形态"（现版 LAST_SHOWN 的语义）；
+            // 从没显示过（--mode=hidden 冷启动）就按展开态出来。
+            let m = match self.last_shown {
+                mode::UiMode::Hidden => mode::UiMode::Expanded,
+                m => m,
+            };
+            MODE.store(mode::mode_code(m), Ordering::Relaxed);
+            self.apply_mode(m);
+        }
+    }
+
+    /// 托盘「锁定 / 解锁」与快捷键共用：切换 `WS_EX_TRANSPARENT` 并持久化。
+    fn toggle_lock(&mut self) {
+        let on = self.locked.toggle();
+        self.apply_lock(on);
+        self.save_config();
+        log_line(&format!("lock={on}"));
+        if self.visible {
+            self.repaint();
+            let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+            self.present_rect(r);
+        }
+    }
+
+    fn apply_lock(&mut self, on: bool) {
+        // 锁定 = 命中测试跳过本窗口（对照现版 set_ignore_cursor_events(true)）。
+        // WS_EX_TRANSPARENT 是系统级"这里没有窗口"，比在 wndproc 里吞消息彻底：
+        // 吞消息挡不住拖动/悬停对光标的抢占。代价是锁定期间右键也穿透，
+        // 解锁只能走托盘菜单或快捷键——与现版一致（现版锁定后同样只能托盘解锁）。
+        unsafe {
+            let ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+            let flag = WS_EX_TRANSPARENT.0 as isize;
+            let next = if on { ex | flag } else { ex & !flag };
+            if next != ex {
+                SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, next);
+                // 改 exstyle 后必须 SWP_FRAMECHANGED 才生效（同一位置/尺寸）。
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+        }
+        if on {
+            self.hover = false;
+            self.hover_anim.reset();
+            self.set_hot(false);
+            self.drag = None;
+            self.press = None;
+        }
+    }
+
+    /// 托盘「开机自启」：写/删 HKCU Run 并同步勾选态与 config.json。
+    fn toggle_autostart(&mut self) {
+        let next = !self.autostart_on;
+        let ok = autostart::set_enabled(next);
+        if ok {
+            self.autostart_on = next;
+            log_line(&format!("autostart={next}"));
+        } else {
+            log_line(&format!("autostart={next} FAILED"));
+        }
+        self.save_config_autostart(self.autostart_on);
+    }
+
+    /// 托盘菜单内容（结构与现版一致，见 `menu.rs`）。
+    fn menu_items(&self) -> Vec<menu::Item> {
+        menu::items(self.hotkey, self.autostart_on)
+    }
+
+    /// 把当前状态写回 config.json（与 WebView 版字段/排版互通）。
+    ///
+    /// `autostart` 与现版一致：只有托盘菜单点过才改写，其余时候保留文件里的
+    /// 原值——否则用户手工编辑的 `autostart: false` 会被注册表状态覆盖。
+    fn save_config(&mut self) {
+        let old = config::load();
+        let pos = self.expanded_home();
+        let cfg = config::Config {
+            x: pos.map(|p| p.0).or(old.x),
+            y: pos.map(|p| p.1).or(old.y),
+            locked: Some(self.locked.is_on()),
+            autostart: old.autostart,
+        };
+        config::save(&cfg);
+    }
+
+    /// 托盘点了「开机自启」：把新状态显式写进 config.json。
+    fn save_config_autostart(&mut self, on: bool) {
+        let old = config::load();
+        let pos = self.expanded_home();
+        let cfg = config::Config {
+            x: pos.map(|p| p.0).or(old.x),
+            y: pos.map(|p| p.1).or(old.y),
+            locked: Some(self.locked.is_on()),
+            autostart: Some(on),
+        };
+        config::save(&cfg);
+    }
+
+    /// 只在"展开且落定"时把当前矩形当作桌面锚点（对照 remember_expanded_pos）。
+    fn expanded_home(&self) -> Option<(i32, i32)> {
+        if !self.visible || self.current_mode() != mode::UiMode::Expanded || self.morph.is_some() {
+            return None;
+        }
+        let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+        let want = self.layout.card();
+        let settled = (r.w - want.w).abs() <= 2 && (r.h - want.h).abs() <= 2;
+        settled.then_some((r.x, r.y))
+    }
+
+    /// WM_DPICHANGED（P4-5）：换屏后 DPI 变了 → 作废屏幕 DC 缓存、按新缩放
+    /// 重算所有目标尺寸与字号、重建画布。
+    ///
+    /// T3 复核留的联动验证项就在 `window::reset_screen_dc()`：缓存的屏幕 DC
+    /// 属于取它时的显示器，跨屏后继续用它会让 ULW 落位偏到旧屏坐标。
+    fn on_dpi_changed(&mut self, new_dpi: u32) {
+        let scale = (new_dpi as f32 / 96.0).max(0.5);
+        if (scale - self.scale).abs() < 0.001 {
+            return;
+        }
+        window::reset_screen_dc();
+        let screen = screen_rect();
+        // 锚点按新缩放重新钳进屏幕，别把卡片留在屏外。
+        let card_w = (mode::CARD_W * scale as f64).round() as i32;
+        let card_h = (mode::CARD_H * scale as f64).round() as i32;
+        let home = (
+            self.layout
+                .home
+                .0
+                .clamp(screen.x, (screen.x + screen.w - card_w).max(screen.x)),
+            self.layout
+                .home
+                .1
+                .clamp(screen.y, (screen.y + screen.h - card_h).max(screen.y)),
+        );
+        self.scale = scale;
+        self.layout = mode::Layout {
+            scale,
+            screen,
+            home,
+            hot: false,
+            anchor: self.layout.anchor,
+            island_pos: self.layout.island_pos,
+        };
+        // 画布与字号都按 scale 生成，必须整块重建（Renderer 里的 DWrite
+        // format 尺寸在构造时定死，改不了）。
+        let mode_now = self.effective_mode();
+        let target = self.layout.target(mode_now).unwrap_or(self.layout.card());
+        self.stop_morph();
+        self.shapes = None;
+        self.ensure_ui(target);
+        if self.visible {
+            self.repaint();
+            self.present_rect(target);
+        }
+        anim::snap_to(target);
+        if let Ok(mut g) = PRESENTED.lock() {
+            *g = target;
+        }
+        log_line(&format!(
+            "dpi {new_dpi} scale {scale} home={home:?} screen={}x{}",
+            screen.w, screen.h
+        ));
+        // 形态线程有自己的一份 Layout：把新缩放/屏幕/锚点交给它。
+        if let Ok(mut g) = DPI_UPDATE.lock() {
+            *g = Some(DpiUpdate {
+                scale,
+                screen,
+                home,
+            });
+        }
+    }
 }
 
 /// 把 probe 载荷归一化成卡片要显示的代理状态（纯映射，文案在 card.rs）。
@@ -1099,10 +1394,91 @@ fn proxy_status(p: Option<&probe::ProbePayload>) -> card::ProxyStatus<'_> {
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    /// 托盘句柄单独放：`TrackPopupMenu` 会开**嵌套消息循环**，期间 WM_TIMER
+    /// 会再次借用 `APP`；如果菜单回调还在 `APP` 借用里就会 `RefCell already
+    /// borrowed` panic（实测过）。所以托盘不放进 App。
+    static TRAY: RefCell<Option<tray::Tray>> = const { RefCell::new(None) };
+    /// 单实例唤醒消息 id（`RegisterWindowMessageW` 返回值，0 = 注册失败）。
+    static WAKE_MSG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // 单实例：第二实例通过 RegisterWindowMessageW 投递唤醒消息（P4-4）。
+    if msg == WAKE_MSG.with(|m| m.get()) && msg != 0 {
+        APP.with(|a| {
+            if let Some(app) = a.borrow_mut().as_mut() {
+                app.wake_from_second_instance();
+            }
+        });
+        return LRESULT(0);
+    }
     match msg {
+        tray::WM_TRAYICON => {
+            let mouse = tray::mouse_message(wp.0);
+            let pt = tray::point_from_lparam(lp.0);
+            // 左键抬起 = 显/隐（对照现版 Click(Up) → toggle_visible）。这条路径
+            // 不进嵌套消息循环，可以持借用。
+            if tray::is_left_up(mouse) {
+                APP.with(|a| {
+                    if let Some(app) = a.borrow_mut().as_mut() {
+                        app.toggle_visible();
+                    }
+                });
+                return LRESULT(0);
+            }
+            if !tray::is_right_up(mouse) {
+                return LRESULT(0);
+            }
+            // 右键抬起 = 弹菜单。**先取菜单内容并释放 APP 借用**，再 TrackPopupMenu：
+            // 它会开嵌套消息循环，嵌套里的 WM_TIMER/WM_MOUSEMOVE 会再次借用 APP，
+            // 持借用调用必 panic（实测 `RefCell already borrowed`）。
+            let items = APP.with(|a| a.borrow().as_ref().map(|app| app.menu_items()));
+            let Some(items) = items else {
+                return LRESULT(0);
+            };
+            let action = TRAY.with(|t| {
+                t.borrow()
+                    .as_ref()
+                    .and_then(|tray| tray.show_menu(&items, pt))
+            });
+            if let Some(action) = action {
+                APP.with(|a| {
+                    if let Some(app) = a.borrow_mut().as_mut() {
+                        app.on_menu_action(action);
+                    }
+                });
+            }
+            LRESULT(0)
+        }
+        WM_HOTKEY => {
+            APP.with(|a| {
+                if let Some(app) = a.borrow_mut().as_mut() {
+                    app.toggle_lock();
+                }
+            });
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            // wparam 低字是新 DPI；lparam 是系统建议的窗口矩形（我们不用它：
+            // 窗口矩形由 ULW 的 pptDst/psize 决定，不是 SetWindowPos）。
+            let dpi = (wp.0 & 0xFFFF) as u32;
+            APP.with(|a| {
+                if let Some(app) = a.borrow_mut().as_mut() {
+                    app.on_dpi_changed(dpi);
+                }
+            });
+            LRESULT(0)
+        }
+        window::WM_APP_DPI => {
+            // 轮询兜底路径（ULW 落位不触发 WM_DPICHANGED 的场合）。
+            let dpi = wp.0 as u32;
+            APP.with(|a| {
+                if let Some(app) = a.borrow_mut().as_mut() {
+                    app.on_dpi_changed(dpi);
+                }
+            });
+            LRESULT(0)
+        }
         window::WM_APP_SAMPLE => {
             APP.with(|a| {
                 if let Some(app) = a.borrow_mut().as_mut() {
@@ -1248,7 +1624,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
+        WM_CLOSE => {
+            // 托盘「退出」与外部 CloseMainWindow 都走这里：先落盘再销毁。
+            APP.with(|a| {
+                if let Some(app) = a.borrow_mut().as_mut() {
+                    app.save_config();
+                }
+            });
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            // 退出前把状态落盘（位置/锁定/自启）并注销快捷键。
+            APP.with(|a| {
+                if let Some(app) = a.borrow_mut().as_mut() {
+                    app.save_config();
+                }
+            });
+            unsafe {
+                let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+            }
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -1269,6 +1664,10 @@ fn screen_rect() -> anim::Rect {
             GetSystemMetrics(SM_CYSCREEN),
         )
     }
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn fg_class(h: HWND) -> String {
@@ -1322,6 +1721,12 @@ fn fg_window_rect(fg: HWND) -> Option<anim::Rect> {
         }
         Some(anim::Rect::new(r.left, r.top, w, h))
     }
+}
+
+/// boot 诊断同时进 stderr 与日志（GUI 进程 stderr 无处可看）。
+fn log_boot(s: &str) {
+    eprintln!("{s}");
+    log_line(s);
 }
 
 fn log_line(s: &str) {
@@ -1522,23 +1927,44 @@ fn morph_frame(ms: f64, args: &[String]) -> Result<()> {
 }
 
 fn run(args: &[String]) -> Result<()> {
+    // P4-4 单实例：第二个进程不建窗，唤起既有窗后立刻退出。
+    // 诊断参数（--bench/--selftest/…）在上面的 main 里已各自 return，不受影响。
+    let single = instance::SingleInstance::acquire();
+    if single.as_ref().map(|s| s.launch()) == Some(instance::Launch::Second) {
+        let woken = instance::wake_existing().is_ok();
+        eprintln!("[boot] second instance -> wake_existing={woken}, exiting");
+        return Ok(());
+    }
+
     let scale = window::dpi_scale();
     let screen = screen_rect();
     let silent = args.iter().any(|a| a == "--silent");
     let mode_override = parse_mode_override(args);
     let dot_override = parse_dot_override(args);
     let island_pos = window::parse_points(args, "--island-pos").first().copied();
-    eprintln!(
-        "[boot] args={args:?} silent={silent} scale={scale} dpi={} screen={}x{} mode={mode_override:?}",
+
+    // P4-3：位置/锁定/自启跨重启保持。config.json 与 WebView 版同一文件。
+    let stored = config::load();
+    let want_locked = stored.locked.unwrap_or(false);
+    let want_autostart = stored.autostart.unwrap_or(true);
+
+    log_boot(&format!(
+        "boot args={args:?} silent={silent} scale={scale} dpi={} screen={}x{} mode={mode_override:?} config={stored:?}",
         unsafe { GetDpiForSystem() },
         screen.w,
         screen.h
-    );
+    ));
 
+    // 位置：命令行 --pos 优先（诊断/截图用），否则用可信配置，否则默认锚点。
+    let card_w = (mode::CARD_W * scale as f64).round() as i32;
+    let card_h = (mode::CARD_H * scale as f64).round() as i32;
     let home = match window::parse_points(args, "--pos").first() {
         Some(p) => *p,
-        None => mode::default_home(screen, scale),
+        None => config::usable_home(&stored, screen, card_w, card_h)
+            .unwrap_or_else(|| mode::default_home(screen, scale)),
     };
+    // 跨屏 DPI 变化时 `on_dpi_changed` 会重算 scale/screen（它是 App 字段，
+    // 这里只留注释说明为什么启动时读一次就够）。
     let layout = mode::Layout {
         scale,
         screen,
@@ -1683,6 +2109,23 @@ fn run(args: &[String]) -> Result<()> {
         });
     }
 
+    // P4-5 DPI 轮询兜底：窗口位置由 ULW 的 pptDst 决定，跨屏拖动可能不发
+    // WM_DPICHANGED。2 s 查一次 GetDpiForWindow，变了就交给 UI 线程重建。
+    {
+        let raw = raw;
+        std::thread::spawn(move || {
+            let mut last = unsafe { window::dpi_scale_for(HWND(raw as *mut std::ffi::c_void)) };
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                let now = unsafe { window::dpi_scale_for(HWND(raw as *mut std::ffi::c_void)) };
+                if (now - last).abs() > 0.001 {
+                    last = now;
+                    window::post_dpi(raw, (now * 96.0).round() as u32);
+                }
+            }
+        });
+    }
+
     let mut app = App {
         ui,
         hwnd,
@@ -1738,6 +2181,10 @@ fn run(args: &[String]) -> Result<()> {
         click_t0: Instant::now(),
         press: None,
         press_moved: false,
+        locked: lock::Lock::new(want_locked),
+        hotkey: None,
+        autostart_on: false,
+        last_shown: initial_mode,
     };
     app.repaint();
     app.present_rect(initial_rect);
@@ -1745,6 +2192,57 @@ fn run(args: &[String]) -> Result<()> {
     MODE.store(mode::mode_code(initial_mode), Ordering::Relaxed);
     APP.with(|a| *a.borrow_mut() = Some(app));
     VISIBLE_FLAG.store(start_visible as u8, Ordering::Relaxed);
+
+    // 单实例唤醒消息：UI 线程收到后由 wndproc 转给 App（P4-4）。
+    unsafe {
+        let id = RegisterWindowMessageW(windows::core::PCWSTR(wide(instance::wake_message_name()).as_ptr()));
+        WAKE_MSG.with(|m| m.set(id));
+    }
+
+    // P4-2 快捷键：候选序与现版一致，取第一个注册成功的。
+    let hotkey = unsafe {
+        hotkey::pick(|c| {
+            RegisterHotKey(Some(hwnd), HOTKEY_ID, c.mods, c.vk).is_ok()
+        })
+    };
+    log_boot(&format!("boot hotkey={:?}", hotkey.map(|h| h.label)));
+
+    // P4-1 托盘：图标从内嵌 PNG 生成；失败也不影响主窗口（菜单可由快捷键兜底）。
+    let tray_ok = match tray::Tray::add(hwnd) {
+        Ok(t) => {
+            TRAY.with(|slot| *slot.borrow_mut() = Some(t));
+            true
+        }
+        Err(e) => {
+            log_line(&format!("tray add failed: {e:?}"));
+            false
+        }
+    };
+
+    // P4-3 自启：首次运行默认开（对齐现版 want_autostart = cfg.autostart.unwrap_or(true)）。
+    let autostart_cmd = autostart::ensure(want_autostart);
+    let autostart_on = autostart::is_enabled();
+
+    // 状态回填到 App（单实例/托盘/热键/自启都要在 UI 线程可见）。
+    APP.with(|a| {
+        if let Some(app) = a.borrow_mut().as_mut() {
+            app.hotkey = hotkey;
+            app.autostart_on = autostart_on;
+            if want_locked {
+                app.apply_lock(true);
+            }
+        }
+    });
+    log_boot(&format!(
+        "boot tray={tray_ok} hotkey={:?} locked={want_locked} autostart={autostart_on} cmd={autostart_cmd:?}",
+        hotkey.map(|h| h.label)
+    ));
+    // 首次把状态落盘：即便用户没做任何操作，config.json 也会带上当前锁定/自启。
+    APP.with(|a| {
+        if let Some(app) = a.borrow_mut().as_mut() {
+            app.save_config();
+        }
+    });
 
     // 形变线程：apply 把每帧矩形交给 UI 线程呈现；current 读窗口当前矩形。
     anim::start(
@@ -1769,6 +2267,17 @@ fn run(args: &[String]) -> Result<()> {
             std::thread::sleep(Duration::from_millis(ms));
             MODE.store(mode::mode_code(m), Ordering::Relaxed);
             window::post(raw, window::WM_APP_MODE);
+        });
+    }
+
+    // 诊断：`--dpi-test DPI` 起手 1.5 s 后投递一次 DPI 变化（走真实
+    // on_dpi_changed 路径，单屏机器也能验证"重建 surface/字号 + 刷新屏幕 DC
+    // 缓存"这一段）。参数是目标 DPI（96/144/192…），不是毫秒。
+    if let Some(dpi) = parse_flag_value(args, "--dpi-test").and_then(|v| v.parse::<u32>().ok()) {
+        let raw = raw;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            window::post_dpi(raw, dpi);
         });
     }
 
@@ -1822,6 +2331,25 @@ fn run(args: &[String]) -> Result<()> {
 
                 let kind = mode::classify_fg(&class);
                 let current = mode::mode_from_code(MODE.load(Ordering::Relaxed));
+                // D6：托盘的"显示/隐藏"每拍同步给 gate——隐藏后全屏路过、
+                // 退出全屏、桌面稳定都不得把它抢回来；只有托盘"显示"才清零。
+                gate.set_manual_hidden(MANUAL_HIDDEN.load(Ordering::Relaxed) != 0);
+                // 跨屏 DPI 变化：UI 线程算好的新布局在这里换掉自己的副本，
+                // 否则本线程会按旧缩放重算胶囊/卡片目标，把窗口弹回旧尺寸。
+                if let Some(u) = DPI_UPDATE.lock().ok().and_then(|mut g| g.take()) {
+                    layout.scale = u.scale;
+                    layout.screen = u.screen;
+                    layout.home = u.home;
+                    anchor = mode::IslandAnchor::Center;
+                    layout.anchor = anchor;
+                    // 本拍算出的 target 立刻按新缩放对齐：否则这一拍还会用
+                    // 旧 layout 的几何发一帧，表现为跨屏瞬间窗口尺寸回弹。
+                    if let Some(r) = layout.target(current) {
+                        if current != mode::UiMode::Hidden {
+                            anim::snap_to(r);
+                        }
+                    }
+                }
                 // hover 放大由 UI 线程写 HOT；躲让重算 target 时必须用同一尺寸，
                 // 否则 hover 中遇到躲让会把胶囊缩回 144×34。
                 layout.hot = HOT.load(Ordering::Relaxed) != 0;
