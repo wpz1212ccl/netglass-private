@@ -1,9 +1,9 @@
 # AFK journal — 原生渲染切换（native-render）
 
 **状态**
-- 已完成：T1（D9 成立）、T2（29 绿，`a096467`）、T3 胶囊态（43 绿，`715b121`，#3 已关）、T4 展开卡片（58 绿，合并 `57e1d4d`，#4 已关；三项指标 root-only 口径全达标，rubric 8.8/10）
-- 进行中：T5 形变弹簧与数字动画（即将派发，`.scratch/afk-t5-prompt.md` 已备）
-- 下一步：T6 系统集成 → T7 全量验收收官（双轴 code-review + 演示 + 收官报告，停在合并门）
+- 已完成：T1（D9 成立）、T2（29 绿，`a096467`）、T3 胶囊态（43 绿，`715b121`，#3 已关）、T4 展开卡片（58 绿，`57e1d4d`，#4 已关，root-only 全达标，rubric 8.8）、T5 形变/数字弹簧（84 绿，`0e744fe`，#5 已关，rubric 9.0）
+- 进行中：T6 系统集成（即将派发，`.scratch/afk-t6-prompt.md` 已备）
+- 下一步：T7 全量验收收官（双轴 code-review + 演示 + 收官报告，停在合并门）
 - **T4 视觉复核（主 agent 亲自看图）**：`card-default.png` / `card-hover.png` 里 35px squircle、Inter 数字「114/118」字距紧、5 格 hover 详情（延迟 23ms / 峰值 118 KB/s / 链路 243 Mbps / 上行峰值 30 KB/s / 代理 未加速）、蓝色曲线、底栏交叉淡出均在，层次符合 iOS 小组件范式。但两张图左侧有竖直暗带 + 小圆角矩形叠影；`desktop-full.png` 显示屏幕被最大化浏览器占满、左上角仍有常驻 WebView2 版 NetGlass 胶囊（「2.9 MB/s ↑ 148 KB/s」）→ **是常驻版叠在原生卡片左边缘，属证据构图问题、非产品缺陷**（goal §3a 已预警并存重叠）。已要求 T4 用 `--mode=expanded --pos` 摆到空白区 + `--hit` 探坐标补拍 clean 版。
 - **T4 主 agent 复跑 `--bench`**：paint **2.560 ms/帧**（T4 报 2.26，环境波动，均 <5 ms 门槛 → D9 仍成立）；`--selftest` 卡片 squircle 与胶囊 `d>=1.02` 像素 0 / max_alpha 0，且打印 `font Inter, collection sees Inter = true, weights=[400,450,500,560,600,...]`。`outside-samples` 前 8 点非零是因为旧椭圆采样点现在落在 squircle 内部（审计已改为 squircle 距离判定），逻辑自洽，T7 留意即可。
 - **T4 展开态测量复核（主 agent 按 CSV 独立复算）**：`measure-expanded.csv` 23 点 → sum_dcpu 4.1097s / sum_dt 233.45s = **1.7604% 单核 = 0.11% 整机**（<2% 阈值，**达标**）；逐点中位 1.6269 / p90 2.5146；Private 中位 23.41 MB（<25 达标）；**WS 中位 47.41 MB > 40 MB 阈值（未达标）**。CSV 恒 `n=2`，主 agent 独立核实 `Get-Process netglass-native` 物理只有 **1 个**进程（PID 13480，Start 1:10:29）且无子进程 → `n=2` 是测量脚本 `Get-TreeIds` 统计口径偏差（非真派生），spec「进程数=1」物理成立。WS 较 T3 岛态 23 MB 上涨归因：卡片玻璃离屏缓存 + Inter 5 静态实例 + 自定义 DWrite font collection（`--bench` 的 25.3/29.1 MB 是进程内阶段值，与常驻稳态不同口径）。已要求 T4 重测确认；若仍 >40 MB，按「内存部分达标、待用户决策」如实上报（与岛态 CPU 项并列）。
@@ -166,3 +166,30 @@ test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 ## 续跑交接（会话 2 · 2026-11-13 22:xx）
 
 doctor `--quick` ALL GREEN；`gh auth status` 正常。主 agent 亲自复跑 `cd native && cargo test --quiet` → 29 绿（确认断点状态）。`render.rs` 当前卡片仍是**椭圆原型**、岛态为粗糙版；T3/T4 都要改 `render.rs` 且共享 `Renderer`/`Frame`，并行必冲突 → 按 goal §6「撞额度退避串行」改为 T3→T4→T5→T6→T7 串行推进。视觉对照源：`src/index.html`（673 行，CSS 数值为像素级对照表）；Inter 字体 `src/fonts/inter-var.woff2`（fontTools 4.63 可转 ttf）；`src-tauri/icons/tray.png` 供 T6。测量脚本 `.scratch/measure-t1.ps1`（T3/T7 复用）。
+
+## T5 形变弹簧与数字动画（完成 · implementer 完工 · 主 agent 复核合并）
+
+**决策依据**：spec §3 Phase 3 后半（P3-6/P3-7）、票 #5、goal §4 D8/D9、pm rubric。
+
+**做了什么**（implementer subagent，commit `686700d`，8 文件 +1812/−81）：新增 `morph.rs`（形变时间轴纯函数：retreat/enter_delay/content_ready 双条件/content_in_alpha/morph_frame_radius，10 单测）、`number.rs`（前端 Spring(k=175,c=21) 逐字移植：30fps 闸、1% 阈值+1024B/s 下限、animUntil 300ms、settled，10 单测）、`input.rs`（双击 500ms/6px 自数 + 拖动阈值 3px，4 单测）；`render.rs` 加 ShapePainter（形变帧按当前矩形 1:1 重铺，不缩放降级）+ content_alpha（D2D layer 只淡内容不淡形状）；`window.rs` 加 present_rect_alpha（.out 220ms 淡出）；`mode.rs` 加 pinned_here（点击展开 pin 8s）；`main.rs` 三阶段形变状态机 + 数字弹簧接线 + 诊断参数 --morph-frame/--morph-demo。
+
+**复核（主 agent 亲自跑 + 抽查）**：
+- t5 worktree 与合并后主树各跑一遍 `cargo test` → **84 passed; 0 failed**；release 构建通过；护栏 `git diff --stat 3c1656b..t5-morph -- src-tauri src` 空、`Cargo.toml` 零改动。
+- 关键断言抽查（读码确认）：速度连续性（重定向不清零速度）、0.5% 吸附/2% 起摆/1024B/s 下限、中间帧无文字（时间+尺寸双条件，10%/3% 拒绝、1.2% 进场）、零流量零动画。
+- S 级亲验：3 个形变中间帧（120/240/320ms）**纯形状无文字**；settled 内容完整；恢复首帧非空板（淡入中略淡）。几何 CSV 独立复核：展开 216×51→过冲 514×332→回稳 480×300；收回过冲 196×32→回稳 216×51；多轮形变连续无跳变。
+- `--selftest` 亲跑：d≥1.02 alpha 全 0；morph shape paint 0.854 ms/帧。
+- rubric 形变自评 **9.0/10**（扣 1.0：中间帧圆角普通矩形降级，P3-1 允许）。
+
+**A 级证据（原样尾行）**：
+```
+running 84 tests
+test result: ok. 84 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+```
+
+**implementer 顺带修复 3 个真实缺陷**（形变新接线自纠，主 agent 认可）：① 看门狗死循环（enter_at 置位后仍每 16ms 重置）；② 形变途中 hover 改落点致几何不可达（改只重定向弹簧）；③ 点击判定用错形态（新增 effective_mode() 以目标形态为准）。
+
+**已知取舍**：进场不等 250/360ms 而等几何落定（展开≈500ms/收回≈400ms）——原生无 WebView 中间尺寸重排能力，差几像素即拉伸文字；观感与前端同量级。
+
+**合并**：`0e744fe`（merge: T5 morph spring + number animation）。**票 #5 已关**（证据评论 6863245499）。worktree 待清理。
+
+---
