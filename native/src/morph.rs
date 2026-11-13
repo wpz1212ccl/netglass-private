@@ -59,8 +59,9 @@ pub fn size_error(cur: anim::Rect, target: anim::Rect) -> f64 {
     dw.max(dh)
 }
 
-/// 正文是否该回来了：时间过 `enter_delay` **且** 尺寸误差 ≤3%。
-/// 两者都满足前，中间帧只有形状、没有文字（`.morphing` 语义）。
+/// 正文是否该回来了：时间过 `enter_delay` **且** 尺寸误差 ≤1.5%
+/// （`CONTENT_ENTER_ERR`）。两者都满足前，中间帧只有形状、没有文字
+/// （`.morphing` 语义）。
 pub fn content_ready(t_ms: f64, target: UiMode, cur: anim::Rect, to: anim::Rect) -> bool {
     t_ms >= enter_delay_ms(target) && size_error(cur, to) <= CONTENT_ENTER_ERR
 }

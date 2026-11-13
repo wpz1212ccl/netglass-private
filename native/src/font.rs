@@ -110,7 +110,34 @@ pub fn system_has_family(dwrite: &windows::Win32::Graphics::DirectWrite::IDWrite
 /// CreateTextFormat 会静默回退 Segoe UI）。DWrite 3 的 FontSetBuilder 是
 /// 官方支持的内存/文件字体集合路径，AddFontFile 需要磁盘路径，所以这里
 /// 落一份 335 KB 的缓存文件（内容不变则不重写）。
+///
+/// collection 按 DWrite 工厂 memoize（T7 review：启动要建 3 个 Renderer、
+/// hover/形变还会重建画布；不缓存则每次重建都重读 5 个 ttf + 重跑 FontSet）。
+/// 首次失败不缓存——允许下次（比如 TEMP 恢复后）重试。
 pub fn load_collection(
+    dwrite: &windows::Win32::Graphics::DirectWrite::IDWriteFactory,
+) -> Option<windows::Win32::Graphics::DirectWrite::IDWriteFontCollection1> {
+    use std::cell::RefCell;
+
+    thread_local! {
+        // DWRITE_FACTORY_TYPE_SHARED：同进程所有 DWriteCreateFactory 返回同一
+        // COM 对象，collection 缓存一份即可全局复用。COM 接口非 Send，挂
+        // thread_local 保活（Renderer 都在同一线程创建）。
+        static KEEP: RefCell<Option<windows::Win32::Graphics::DirectWrite::IDWriteFontCollection1>> =
+            const { RefCell::new(None) };
+    }
+
+    let cached = KEEP.with(|k| k.borrow().clone());
+    if cached.is_some() {
+        return cached;
+    }
+    // 首次失败不缓存：下次画布重建（如 TEMP 恢复后）允许重试。
+    let built = build_collection(dwrite)?;
+    KEEP.with(|k| *k.borrow_mut() = Some(built.clone()));
+    Some(built)
+}
+
+fn build_collection(
     dwrite: &windows::Win32::Graphics::DirectWrite::IDWriteFactory,
 ) -> Option<windows::Win32::Graphics::DirectWrite::IDWriteFontCollection1> {
     use std::os::windows::ffi::OsStrExt;

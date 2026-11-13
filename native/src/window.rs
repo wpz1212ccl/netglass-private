@@ -39,12 +39,14 @@ pub fn dpi_scale_for(hwnd: HWND) -> f32 {
 ///
 /// **跨 DPI 屏移动时必须作废**（T3 复核留的联动验证项）：缓存的 DC 绑定在
 /// 取它时的那块显示器上，`WM_DPICHANGED` 之后继续用旧 DC 会让 ULW 落位偏移。
+/// 缓存与作废必须共用同一个 thread_local（T7 review 发现：曾各自内联一份，
+/// 导致 reset 清的是自己的空缓存，旧 DC 永不失效）。
+thread_local! {
+    static SCREEN_DC: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
 fn screen_dc() -> HDC {
-    use std::cell::Cell;
-    thread_local! {
-        static CACHE: Cell<isize> = const { Cell::new(0) };
-    }
-    CACHE.with(|c| {
+    SCREEN_DC.with(|c| {
         let v = c.get();
         if v != 0 {
             return HDC(v as *mut c_void);
@@ -57,11 +59,7 @@ fn screen_dc() -> HDC {
 
 /// 丢掉缓存的屏幕 DC（`WM_DPICHANGED` 用）。下一次 `present_dc` 会重新取。
 pub fn reset_screen_dc() {
-    use std::cell::Cell;
-    thread_local! {
-        static CACHE: Cell<isize> = const { Cell::new(0) };
-    }
-    CACHE.with(|c| {
+    SCREEN_DC.with(|c| {
         let v = c.get();
         if v != 0 {
             unsafe {

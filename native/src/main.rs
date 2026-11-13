@@ -1620,8 +1620,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            // 右键退出：NOACTIVATE 窗口不抢焦点，别留下无法关闭的孤儿进程
-            let _ = DestroyWindow(hwnd);
+            // 右键不再退出（T7 review：原型遗留，常驻应用误触即退；托盘「退出」
+            // 与 WM_CLOSE 才是正式出口）。右键菜单未要求，吞掉即可。
             LRESULT(0)
         }
         WM_CLOSE => {
