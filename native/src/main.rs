@@ -49,6 +49,8 @@ const HIST: usize = 60;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 /// 岛态呼吸/颜色过渡定时器 id（66 ms，D1 15 fps）。
 const TIMER_BREATHE: usize = 1;
+/// 展开态 hover 详情时间轴定时器 id（16 ms，只在动画进行中运行）。
+const TIMER_HOVER: usize = 2;
 
 /// 实际显示形态。apply_mode 维护；形态线程写、UI 线程读。
 static MODE: AtomicU8 = AtomicU8::new(0);
@@ -91,6 +93,13 @@ fn main() {
     if args.iter().any(|a| a == "--hit") {
         for (x, y) in window::parse_points(&args, "--hit") {
             println!("{}", window::describe_at(x, y));
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--fonts") {
+        if let Err(e) = fonts() {
+            eprintln!("fonts failed: {e:?}");
+            std::process::exit(1);
         }
         return;
     }
@@ -146,6 +155,7 @@ struct App {
     visible: bool,
 
     hist: [f64; HIST],
+    up_hist: [f64; HIST],
     unit_mb: bool,
     hover: bool,
     /// 岛态按下（玻璃 brightness .965）。
@@ -167,10 +177,21 @@ struct App {
     title: String,
     state: String,
     wifi: String,
-    proxy_text: String,
+    wifi_ok: bool,
+    /// 底栏代理值 + 详情第 5 格代理值（同一份 probe 载荷的两种文案）。
+    foot_proxy: String,
+    proxy_tone: card::Tone,
+    detail_proxy: String,
+    detail_tone: card::Tone,
+    latency: Option<f64>,
+    link_mbps: Option<f64>,
     down: (String, String),
     up: (String, String),
     last_key: String,
+    /// 展开态 hover 时间轴（16 ms 定时器只在动画期间运行）。
+    hover_anim: fx::HoverAnim,
+    hover_timer_on: bool,
+    hover_t0: Instant,
 }
 
 impl App {
@@ -187,6 +208,16 @@ impl App {
             0
         };
         let tint = self.tint.current();
+        let peak = self.hist.iter().cloned().fold(0.0f64, f64::max);
+        let peak_up = self.up_hist.iter().cloned().fold(0.0f64, f64::max);
+        let details = card::detail_rows(
+            self.latency,
+            peak,
+            self.link_mbps,
+            peak_up,
+            (&self.detail_proxy, self.detail_tone),
+        );
+        let now_ms = self.hover_t0.elapsed().as_secs_f64() * 1000.0;
         render::Frame {
             title: self.title.clone(),
             state: self.state.clone(),
@@ -195,9 +226,13 @@ impl App {
             up_value: self.up.0.clone(),
             up_unit: self.up.1.clone(),
             wifi: self.wifi.clone(),
-            proxy: self.proxy_text.clone(),
+            wifi_ok: self.wifi_ok,
+            proxy: self.foot_proxy.clone(),
+            proxy_tone: self.proxy_tone,
+            details,
             hist: self.hist.to_vec(),
             hover: self.hover,
+            hover_fx: self.hover_anim.at(now_ms),
             active: self.active,
             dot: render::DotPaint {
                 rgb: tint.rgb,
@@ -250,13 +285,17 @@ impl App {
         }
         self.applied = code;
         MODE.store(code, Ordering::Relaxed);
+        // 形态切换时 hover 时间轴归零：展开态的详情动画不能带进胶囊/隐藏态，
+        // 反向切换也从头开始（鼠标若仍压着，下一次 WM_MOUSEMOVE 会重新触发）。
+        self.hover = false;
+        self.hover_anim.reset();
+        self.sync_hover_timer();
         // 躲让（形态线程）与 hover（UI 线程）共享挂载点/放大状态。
         self.layout.hot = HOT.load(Ordering::Relaxed) != 0;
         self.layout.anchor = mode::anchor_from_code(ANCHOR.load(Ordering::Relaxed));
         if m != mode::UiMode::Island {
             self.layout.hot = false;
             HOT.store(0, Ordering::Relaxed);
-            self.hover = false;
             self.active = false;
         }
 
@@ -354,6 +393,58 @@ impl App {
         }
     }
 
+    /// 展开态 hover：启动 cubic-bezier(.6,0,.25,1) 时间轴；岛态仍走弹簧放大。
+    fn set_hover(&mut self, on: bool) {
+        if self.hover == on {
+            return;
+        }
+        self.hover = on;
+        if self.current_mode() == mode::UiMode::Island {
+            self.set_hot(on);
+            return;
+        }
+        if self.current_mode() != mode::UiMode::Expanded || !self.visible {
+            return;
+        }
+        let now = self.hover_t0.elapsed().as_secs_f64() * 1000.0;
+        self.hover_anim.begin(now, on);
+        self.repaint();
+        let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+        self.present_rect(r);
+        self.sync_hover_timer();
+    }
+
+    /// 16 ms 定时器只在展开态动画未走完时运行（空闲展开态不产生任何出帧）。
+    fn sync_hover_timer(&mut self) {
+        let need = self.hover_anim.is_active()
+            && self.current_mode() == mode::UiMode::Expanded
+            && self.visible;
+        if need && !self.hover_timer_on {
+            unsafe {
+                let _ = SetTimer(Some(self.hwnd), TIMER_HOVER, 16, None);
+            }
+            self.hover_timer_on = true;
+        } else if !need && self.hover_timer_on {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_HOVER);
+            }
+            self.hover_timer_on = false;
+        }
+    }
+
+    fn on_hover_timer(&mut self) {
+        let now = self.hover_t0.elapsed().as_secs_f64() * 1000.0;
+        if self.hover_anim.done(now) {
+            self.hover_anim.finish();
+        }
+        if self.visible {
+            self.repaint();
+            let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+            self.present_rect(r);
+        }
+        self.sync_hover_timer();
+    }
+
     fn refresh(&mut self) {
         let mut last = None;
         while let Ok(s) = self.rx.try_recv() {
@@ -363,10 +454,16 @@ impl App {
             self.apply(&s);
         }
         let payload = self.probe.lock().ok().and_then(|g| g.clone());
-        self.proxy_text = match payload.as_ref().and_then(|p| p.proxy.port) {
-            Some(port) => format!("代理 :{port}"),
-            None => "代理 未启用".to_string(),
-        };
+        let status = proxy_status(payload.as_ref());
+        let (foot, ftone) = card::proxy_foot(status);
+        let (detail, dtone) = card::proxy_detail(status);
+        self.foot_proxy = foot;
+        self.proxy_tone = ftone;
+        self.detail_proxy = detail;
+        self.detail_tone = dtone;
+        self.latency = payload
+            .as_ref()
+            .and_then(|p| if p.direct.ok { p.direct.ms } else { None });
 
         // 呼吸灯三态色 + DC 条件；颜色变化走 0.4 s 插值。
         let mut dot_changed = false;
@@ -420,7 +517,7 @@ impl App {
         let mut k = String::new();
         let _ = write!(
             k,
-            "{}|{}|{} {}|{} {}|{}|{}|{}",
+            "{}|{}|{} {}|{} {}|{}|{}|{}|{:?}|{}|{:?}|{:?}|{:?}|{}",
             self.title,
             self.state,
             self.down.0,
@@ -428,10 +525,20 @@ impl App {
             self.up.0,
             self.up.1,
             self.wifi,
-            self.proxy_text,
+            self.wifi_ok,
+            self.foot_proxy,
+            self.proxy_tone,
+            self.detail_proxy,
+            self.detail_tone,
+            self.latency,
+            self.link_mbps,
             self.hover
         );
         for v in self.hist.iter() {
+            let _ = write!(k, ",{v:.0}");
+        }
+        k.push('|');
+        for v in self.up_hist.iter() {
             let _ = write!(k, ",{v:.0}");
         }
         k
@@ -444,17 +551,55 @@ impl App {
             None => "无网络".to_string(),
         };
         self.state = if primary.is_some() { "已连接" } else { "无网络" }.to_string();
-        self.wifi = match s.ifaces.iter().find(|i| i.kind == "wifi") {
-            None => "Wi-Fi 无",
-            Some(i) if i.state == "up" => "Wi-Fi 已连接",
-            Some(_) => "Wi-Fi 未连接",
+        self.link_mbps = primary.and_then(|i| i.link_mbps);
+        match s.ifaces.iter().find(|i| i.kind == "wifi") {
+            None => {
+                self.wifi = "无".to_string();
+                self.wifi_ok = false;
+            }
+            Some(i) if i.state == "up" => {
+                self.wifi = "已连接".to_string();
+                self.wifi_ok = true;
+            }
+            Some(_) => {
+                self.wifi = "未连接".to_string();
+                self.wifi_ok = false;
+            }
         }
-        .to_string();
         self.down = fmt_hysteresis(s.total_down, &mut self.unit_mb);
-        self.up = fmt_plain(s.total_up);
+        self.up = card::format_rate(s.total_up);
         self.hist.rotate_left(1);
         self.hist[HIST - 1] = s.total_down;
+        self.up_hist.rotate_left(1);
+        self.up_hist[HIST - 1] = s.total_up;
     }
+}
+
+/// 把 probe 载荷归一化成卡片要显示的代理状态（纯映射，文案在 card.rs）。
+fn proxy_status(p: Option<&probe::ProbePayload>) -> card::ProxyStatus<'_> {
+    let Some(p) = p else {
+        return card::ProxyStatus::Off;
+    };
+    if let Some(a) = p.proxy.accelerating.first() {
+        return card::ProxyStatus::Accelerating(a);
+    }
+    if let Some(via) = &p.via {
+        if via.ok {
+            if let Some(ms) = via.ms {
+                return card::ProxyStatus::Via(ms);
+            }
+        }
+    }
+    if p.direct.error.as_deref() == Some("paused") {
+        return card::ProxyStatus::Paused;
+    }
+    if p.proxy.port.is_some() {
+        return card::ProxyStatus::Blocked;
+    }
+    if let Some(a) = p.proxy.accelerators.first() {
+        return card::ProxyStatus::NotAccelerating(a);
+    }
+    card::ProxyStatus::Off
 }
 
 thread_local! {
@@ -498,6 +643,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         app.on_timer();
                     }
                 });
+            } else if wp.0 == TIMER_HOVER {
+                APP.with(|a| {
+                    if let Some(app) = a.borrow_mut().as_mut() {
+                        app.on_hover_timer();
+                    }
+                });
             }
             LRESULT(0)
         }
@@ -509,7 +660,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         let r = anim::Rect::new(wx + (c.x - start.x), wy + (c.y - start.y), app.ui.w, app.ui.h);
                         app.present_rect(r);
                     } else if !app.hover {
-                        app.hover = true;
                         let mut tme = TRACKMOUSEEVENT {
                             cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                             dwFlags: TME_LEAVE,
@@ -517,13 +667,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             dwHoverTime: 0,
                         };
                         let _ = TrackMouseEvent(&mut tme);
-                        if app.current_mode() == mode::UiMode::Island {
-                            app.set_hot(true);
-                        } else {
-                            app.repaint();
-                            let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
-                            app.present_rect(r);
-                        }
+                        app.set_hover(true);
                     }
                 }
             });
@@ -533,14 +677,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             APP.with(|a| {
                 if let Some(app) = a.borrow_mut().as_mut() {
                     if app.hover {
-                        app.hover = false;
-                        if app.current_mode() == mode::UiMode::Island {
-                            app.set_hot(false);
-                        } else {
-                            app.repaint();
-                            let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
-                            app.present_rect(r);
-                        }
+                        app.set_hover(false);
                     }
                 }
             });
@@ -894,6 +1031,7 @@ fn run(args: &[String]) -> Result<()> {
         applied: mode::mode_code(initial_mode),
         visible: start_visible,
         hist: [0.0; HIST],
+        up_hist: [0.0; HIST],
         unit_mb: true,
         hover: false,
         active: false,
@@ -910,11 +1048,20 @@ fn run(args: &[String]) -> Result<()> {
         last_tick: Instant::now(),
         title: "正在读取".to_string(),
         state: "—".to_string(),
-        wifi: "Wi-Fi —".to_string(),
-        proxy_text: "代理 —".to_string(),
+        wifi: "—".to_string(),
+        wifi_ok: false,
+        foot_proxy: "未启用".to_string(),
+        proxy_tone: card::Tone::Warn,
+        detail_proxy: "未启用".to_string(),
+        detail_tone: card::Tone::Warn,
+        latency: None,
+        link_mbps: None,
         down: ("—".to_string(), "MB/s".to_string()),
         up: ("—".to_string(), "MB/s".to_string()),
         last_key: String::new(),
+        hover_anim: fx::HoverAnim::new(),
+        hover_timer_on: false,
+        hover_t0: Instant::now(),
     };
     app.repaint();
     app.present_rect(initial_rect);
@@ -1070,15 +1217,47 @@ fn fmt_hysteresis(v: f64, mb: &mut bool) -> (String, String) {
     }
 }
 
-fn fmt_plain(v: f64) -> (String, String) {
-    if !v.is_finite() || v < 1024.0 {
-        return ("0.0".to_string(), "MB/s".to_string());
+/// `--fonts`：自证 DWrite 进程内 collection 真的包含 Inter 及五个字重。
+fn fonts() -> Result<()> {
+    use windows::Win32::Graphics::DirectWrite::{DWriteCreateFactory, DWRITE_FACTORY_TYPE_SHARED, IDWriteFactory};
+    let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
+    match font::load_collection(&dwrite) {
+        Some(c) => {
+            font::dump(&c);
+            println!("custom has Inter = {}", font::has_family(&c, "Inter"));
+            println!("weights = {:?}", font::family_weights(&c, "Inter"));
+        }
+        None => println!("load_collection returned None (DWrite 3 unavailable?)"),
     }
-    let m = v / 1048576.0;
-    if m >= 1.0 {
-        (format!("{m:.1}"), "MB/s".to_string())
-    } else {
-        (format!("{}", (v / 1024.0).round() as i64), "KB/s".to_string())
+    println!("system has Inter = {}", font::system_has_family(&dwrite, "Inter"));
+    Ok(())
+}
+
+/// 诊断/基准用的样例帧（内容固定，方便和 T1 基线数字对比）。
+fn demo_frame(hist: Vec<f64>) -> render::Frame {
+    render::Frame {
+        title: "以太网 2".to_string(),
+        state: "已连接".to_string(),
+        down_value: "2.9".to_string(),
+        down_unit: "MB/s".to_string(),
+        up_value: "148".to_string(),
+        up_unit: "KB/s".to_string(),
+        wifi: "已连接".to_string(),
+        wifi_ok: true,
+        proxy: "23 ms".to_string(),
+        proxy_tone: card::Tone::Normal,
+        details: card::detail_rows(
+            Some(23.0),
+            2.9 * 1048576.0,
+            Some(1000.0),
+            148.0 * 1024.0,
+            ("23 ms", card::Tone::Normal),
+        ),
+        hist,
+        hover: false,
+        hover_fx: fx::HoverFx::IDLE,
+        active: false,
+        dot: render::DotPaint::default(),
     }
 }
 
@@ -1118,21 +1297,15 @@ fn bench() -> Result<()> {
     for (i, v) in hist.iter_mut().enumerate() {
         *v = 4.0e5 + (i as f64 * 9.1e4);
     }
-    let frame = render::Frame {
-        title: "以太网 2".to_string(),
-        state: "已连接".to_string(),
-        down_value: "2.9".to_string(),
-        down_unit: "MB/s".to_string(),
-        up_value: "148".to_string(),
-        up_unit: "KB/s".to_string(),
-        wifi: "Wi-Fi 已连接".to_string(),
-        proxy: "代理 :7897".to_string(),
-        hist,
-        hover: false,
-        active: false,
-        dot: render::DotPaint::default(),
-    };
+    let frame = demo_frame(hist);
     renderer.paint(&frame)?;
+    println!(
+        "font family        = {} (collection sees Inter = {}, system sees Inter = {}, weights = {:?})",
+        renderer.font_family(),
+        renderer.dwrite_has_family("Inter"),
+        renderer.system_has_family("Inter"),
+        renderer.family_weights("Inter")
+    );
     println!("after 1st paint    = {:.1} MB", ws_mb());
     renderer.bench_parts(&frame)?;
     renderer.bench_parts(&frame)?;
@@ -1149,20 +1322,13 @@ fn bench() -> Result<()> {
     let ih = (mode::ISLAND_H * scale as f64).round() as i32;
     let island_surface = window::Surface::new(None, iw, ih)?;
     let island_renderer = render::Renderer::new(island_surface.mem_dc, iw, ih, scale)?;
-    let island_frame = render::Frame {
-        title: String::new(),
-        state: String::new(),
-        down_value: "2.9".to_string(),
-        down_unit: "MB/s".to_string(),
-        up_value: "148".to_string(),
-        up_unit: "KB/s".to_string(),
-        wifi: String::new(),
-        proxy: String::new(),
-        hist: Vec::new(),
-        hover: false,
-        active: false,
-        dot: render::DotPaint::default(),
-    };
+    let mut island_frame = demo_frame(Vec::new());
+    island_frame.title.clear();
+    island_frame.state.clear();
+    island_frame.wifi.clear();
+    island_frame.proxy.clear();
+    island_frame.details =
+        card::detail_rows(None, 0.0, None, 0.0, ("未启用", card::Tone::Warn));
     island_renderer.paint_island(&island_frame)?;
     island_renderer.bench_island_parts(&island_frame)?;
     let t0 = std::time::Instant::now();
@@ -1234,23 +1400,15 @@ fn selftest() -> Result<()> {
     for (i, v) in hist.iter_mut().enumerate() {
         *v = if i % 7 == 0 { 3.0e6 } else { 4.0e5 + (i as f64 * 9.1e4) };
     }
-    let frame = render::Frame {
-        title: "以太网 2".to_string(),
-        state: "已连接".to_string(),
-        down_value: "2.9".to_string(),
-        down_unit: "MB/s".to_string(),
-        up_value: "148".to_string(),
-        up_unit: "KB/s".to_string(),
-        wifi: "Wi-Fi 已连接".to_string(),
-        proxy: "代理 :7897".to_string(),
-        hist,
-        hover: false,
-        active: false,
-        dot: render::DotPaint::default(),
-    };
+    let frame = demo_frame(hist);
     renderer.paint(&frame)?;
 
-    println!("canvas: {w}x{h} physical (scale {scale})");
+    println!(
+        "canvas: {w}x{h} physical (scale {scale}, font {}, collection sees Inter = {}, weights = {:?})",
+        renderer.font_family(),
+        renderer.dwrite_has_family("Inter"),
+        renderer.family_weights("Inter")
+    );
     println!(
         "alpha: center(240,150)={} corner(3,3)={} outside-samples={:?}",
         surface.alpha_at(w / 2, h / 2),
@@ -1274,20 +1432,26 @@ fn selftest() -> Result<()> {
         .collect::<Vec<_>>()
     );
 
-    // Full-bitmap audit: every pixel strictly outside the ellipse must be
+    // Full-bitmap audit: every pixel strictly outside the squircle must be
     // alpha 0. AA fringe pixels sit within ~1px of the curve, so also report
-    // the largest alpha found on pixels that are clearly outside (>=1.02).
-    let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
-    let (rx, ry) = (w as f32 / 2.0, h as f32 / 2.0);
+    // the largest alpha found on pixels that are clearly outside (>=1.02px).
+    // 外投影按 CSS 语义被 border-box/窗口裁剪（参考实现窗口=卡片），所以
+    // 窗口边缘不会出现投影 alpha；这里审计的是整个 DIB。
+    let radius = card::RADIUS * scale;
     let mut outside_any = 0u32;
     let mut outside_far = 0u32;
     let mut max_far_alpha = 0u8;
     for y in 0..h {
         for x in 0..w {
-            let nx = (x as f32 + 0.5 - cx) / rx;
-            let ny = (y as f32 + 0.5 - cy) / ry;
-            let d = nx * nx + ny * ny;
-            if d > 1.0 {
+            let d = card::outside_distance(
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+                w as f32,
+                h as f32,
+                radius,
+                card::EXPONENT,
+            );
+            if d > 0.0 {
                 let a = surface.alpha_at(x, y);
                 if a > 0 {
                     outside_any += 1;
@@ -1300,7 +1464,8 @@ fn selftest() -> Result<()> {
         }
     }
     println!(
-        "outside ellipse (d>1.0): alpha>0 pixels={outside_any} | at d>=1.02: pixels={outside_far} max_alpha={max_far_alpha}"
+        "outside squircle (d>0, r={radius:.1}px n={}): alpha>0 pixels={outside_any} | at d>=1.02: pixels={outside_far} max_alpha={max_far_alpha}",
+        card::EXPONENT
     );
 
     // 胶囊态：圆角矩形之外必须全透明（AA 边带除外）。
@@ -1308,20 +1473,13 @@ fn selftest() -> Result<()> {
     let ih = (mode::ISLAND_H * scale as f64).round() as i32;
     let island_surface = window::Surface::new(None, iw, ih)?;
     let island_renderer = render::Renderer::new(island_surface.mem_dc, iw, ih, scale)?;
-    let island_frame = render::Frame {
-        title: String::new(),
-        state: String::new(),
-        down_value: "2.9".to_string(),
-        down_unit: "MB/s".to_string(),
-        up_value: "148".to_string(),
-        up_unit: "KB/s".to_string(),
-        wifi: String::new(),
-        proxy: String::new(),
-        hist: Vec::new(),
-        hover: false,
-        active: false,
-        dot: render::DotPaint::default(),
-    };
+    let mut island_frame = demo_frame(Vec::new());
+    island_frame.title.clear();
+    island_frame.state.clear();
+    island_frame.wifi.clear();
+    island_frame.proxy.clear();
+    island_frame.details =
+        card::detail_rows(None, 0.0, None, 0.0, ("未启用", card::Tone::Warn));
     island_renderer.paint_island(&island_frame)?;
     let radius = island::capsule_radius(iw as f32, ih as f32, scale);
     let mut cap_any = 0u32;
