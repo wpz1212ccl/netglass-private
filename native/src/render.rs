@@ -5,13 +5,42 @@
 //! antialiases geometry in software and lets DirectWrite shape CJK + Latin with
 //! grayscale AA (ClearType is unusable on a transparent surface).
 
-use windows::core::{PCWSTR, Result};
+use std::cell::RefCell;
+
+use windows::core::{Interface, PCWSTR, Result};
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Gdi::HDC;
-use windows_numerics::Vector2;
+use windows::Win32::Graphics::Gdi::{AlphaBlend, BitBlt, HDC, BLENDFUNCTION, SRCCOPY};
+use windows_numerics::{Matrix3x2, Vector2};
+
+use crate::island;
+use crate::window;
+
+/// 呼吸灯一帧的绘制参数（颜色/光晕/透明度/缩放由 main.rs 的相位表算好）。
+#[derive(Clone, Copy, Debug)]
+pub struct DotPaint {
+    pub rgb: (u8, u8, u8),
+    pub glow: f32,
+    pub alpha: f32,
+    pub scale: f32,
+    /// 呼吸相位索引（0..island::BREATHE_PHASES），用于挑预渲染帧。
+    pub phase: u8,
+}
+
+impl Default for DotPaint {
+    fn default() -> Self {
+        Self {
+            rgb: island::DotColor::Green.rgb(),
+            glow: island::DotColor::Green.glow(),
+            alpha: 1.0,
+            scale: 1.0,
+            phase: 0,
+        }
+    }
+}
 
 /// Every text/value the widget shows for one frame.
 pub struct Frame {
@@ -25,6 +54,9 @@ pub struct Frame {
     pub proxy: String,
     pub hist: Vec<f64>,
     pub hover: bool,
+    /// 岛态按下（`.card.collapsed:active`，玻璃压暗一档）。
+    pub active: bool,
+    pub dot: DotPaint,
 }
 
 fn c(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
@@ -48,6 +80,8 @@ pub struct Renderer {
     scale: f32,
     w: f32,
     h: f32,
+    /// 主 DIB 的 DC（rt 平时绑它；画静态层时临时改绑，再切回来）。
+    mem_dc: HDC,
 
     f_title: IDWriteTextFormat,
     f_state: IDWriteTextFormat,
@@ -56,16 +90,55 @@ pub struct Renderer {
     f_up: IDWriteTextFormat,
     f_upunit: IDWriteTextFormat,
     f_foot: IDWriteTextFormat,
+    f_mdown: IDWriteTextFormat,
+    f_munit: IDWriteTextFormat,
+    f_mup: IDWriteTextFormat,
+    /// tabular-nums：等宽数字，1 Hz 更新时布局不抖。
+    typo: IDWriteTypography,
 
     b_ink: ID2D1SolidColorBrush,
     b_ink2: ID2D1SolidColorBrush,
     b_ink3: ID2D1SolidColorBrush,
+    b_ink6: ID2D1SolidColorBrush,
+    b_ink55: ID2D1SolidColorBrush,
     b_white: ID2D1SolidColorBrush,
+    b_hair72: ID2D1SolidColorBrush,
+    b_hair85: ID2D1SolidColorBrush,
+    b_dot: ID2D1SolidColorBrush,
     b_base: ID2D1SolidColorBrush,
     b_glass: ID2D1LinearGradientBrush,
     b_glass_hover: ID2D1LinearGradientBrush,
     b_line: ID2D1LinearGradientBrush,
     b_area: ID2D1LinearGradientBrush,
+    pill_normal: Pill,
+    pill_hot: Pill,
+    pill_active: Pill,
+    /// 胶囊静态层：玻璃 + 文字 + 发丝画进一张独立 DIB（内容/悬停变化才重画）。
+    /// 呼吸帧用 GDI BitBlt 把它整块拷回主 DIB，不再走 D2D。
+    island_static: RefCell<Option<IslandStatic>>,
+    /// 呼吸点预渲染：32 个相位帧排成一条位图，呼吸帧只 AlphaBlend 一格。
+    dot_tiles: RefCell<Option<DotTiles>>,
+}
+
+struct IslandStatic {
+    key: String,
+    dot_cx: f32,
+    surface: window::Surface,
+}
+
+struct DotTiles {
+    key: String,
+    tile: i32,
+    surface: window::Surface,
+}
+
+/// `.pillbg` 的三层材质：172° 主渐变 + 左上/右上两团径向高光。
+/// 亮度滤镜（hover 1.05 / active .965）在 CSS 里是整层 RGB 乘法，
+/// 这里预生成三套 stop，切换时直接换笔刷，避免逐帧重建。
+struct Pill {
+    base: ID2D1LinearGradientBrush,
+    r1: ID2D1RadialGradientBrush,
+    r2: ID2D1RadialGradientBrush,
 }
 
 impl Renderer {
@@ -123,12 +196,33 @@ impl Renderer {
         let f_up = Self::fmt(&dwrite, text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0 * s)?;
         let f_upunit = Self::fmt(&dwrite, text, DWRITE_FONT_WEIGHT_MEDIUM, 11.0 * s)?;
         let f_foot = Self::fmt(&dwrite, text, DWRITE_FONT_WEIGHT_MEDIUM, 11.0 * s)?;
+        // 胶囊迷你数字：15px/600 + 10px 单位 + 10px 上行（#mDown/#mUnit/.mup）。
+        let f_mdown = Self::fmt(&dwrite, display, DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0 * s)?;
+        let f_munit = Self::fmt(&dwrite, text, DWRITE_FONT_WEIGHT_NORMAL, 10.0 * s)?;
+        let f_mup = Self::fmt(&dwrite, text, DWRITE_FONT_WEIGHT_NORMAL, 10.0 * s)?;
+
+        let typo = unsafe { dwrite.CreateTypography()? };
+        unsafe {
+            typo.AddFontFeature(DWRITE_FONT_FEATURE {
+                nameTag: DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES,
+                parameter: 1,
+            })?;
+        }
 
         let b_ink = unsafe { rt.CreateSolidColorBrush(&c(18, 21, 26, 0.92), None)? };
         let b_ink2 = unsafe { rt.CreateSolidColorBrush(&c(18, 21, 26, 0.64), None)? };
         let b_ink3 = unsafe { rt.CreateSolidColorBrush(&c(18, 21, 26, 0.50), None)? };
+        let b_ink6 = unsafe { rt.CreateSolidColorBrush(&c(18, 21, 26, 0.60), None)? };
+        let b_ink55 = unsafe { rt.CreateSolidColorBrush(&c(18, 21, 26, 0.55), None)? };
         let b_white = unsafe { rt.CreateSolidColorBrush(&c(255, 255, 255, 0.90), None)? };
+        let b_hair72 = unsafe { rt.CreateSolidColorBrush(&c(255, 255, 255, 0.72), None)? };
+        let b_hair85 = unsafe { rt.CreateSolidColorBrush(&c(255, 255, 255, 0.85), None)? };
+        let b_dot = unsafe { rt.CreateSolidColorBrush(&c(52, 199, 89, 1.0), None)? };
         let b_base = unsafe { rt.CreateSolidColorBrush(&c(18, 21, 26, 0.10), None)? };
+
+        let pill_normal = Self::pill(&rt, w as f32, h as f32, island::glass_brightness(false, false))?;
+        let pill_hot = Self::pill(&rt, w as f32, h as f32, island::glass_brightness(true, false))?;
+        let pill_active = Self::pill(&rt, w as f32, h as f32, island::glass_brightness(false, true))?;
 
         let glass_stops = [
             D2D1_GRADIENT_STOP {
@@ -194,6 +288,7 @@ impl Renderer {
             scale: s,
             w: w as f32,
             h: h as f32,
+            mem_dc,
             f_title,
             f_state,
             f_num,
@@ -201,15 +296,29 @@ impl Renderer {
             f_up,
             f_upunit,
             f_foot,
+            f_mdown,
+            f_munit,
+            f_mup,
+            typo,
             b_ink,
             b_ink2,
             b_ink3,
+            b_ink6,
+            b_ink55,
             b_white,
+            b_hair72,
+            b_hair85,
+            b_dot,
             b_base,
             b_glass,
             b_glass_hover,
             b_line,
             b_area,
+            pill_normal,
+            pill_hot,
+            pill_active,
+            island_static: RefCell::new(None),
+            dot_tiles: RefCell::new(None),
         })
     }
 
@@ -236,7 +345,7 @@ impl Renderer {
     }
 
     fn grad(
-        rt: &ID2D1DCRenderTarget,
+        rt: &ID2D1RenderTarget,
         stops: &[D2D1_GRADIENT_STOP],
         start: Vector2,
         end: Vector2,
@@ -247,6 +356,70 @@ impl Renderer {
             endPoint: end,
         };
         unsafe { rt.CreateLinearGradientBrush(&props, None, &collection) }
+    }
+
+    fn radial(
+        rt: &ID2D1RenderTarget,
+        stops: &[D2D1_GRADIENT_STOP],
+        center: Vector2,
+        radius_x: f32,
+        radius_y: f32,
+    ) -> Result<ID2D1RadialGradientBrush> {
+        let collection = unsafe { rt.CreateGradientStopCollection(stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)? };
+        let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
+            center,
+            gradientOriginOffset: Vector2::new(0.0, 0.0),
+            radiusX: radius_x,
+            radiusY: radius_y,
+        };
+        unsafe { rt.CreateRadialGradientBrush(&props, None, &collection) }
+    }
+
+    /// CSS linear-gradient(172deg)：方向从正上方顺时针转 172°，
+    /// 渐变线过中心、长度 = |w·sinθ| + |h·cosθ|。
+    fn linear_172(w: f32, h: f32) -> (Vector2, Vector2) {
+        let theta = 172.0f32.to_radians();
+        let dir = Vector2::new(theta.sin(), -theta.cos());
+        let len = w * dir.X.abs() + h * dir.Y.abs();
+        let center = Vector2::new(w / 2.0, h / 2.0);
+        let half = Vector2::new(dir.X * len / 2.0, dir.Y * len / 2.0);
+        (
+            Vector2::new(center.X - half.X, center.Y - half.Y),
+            Vector2::new(center.X + half.X, center.Y + half.Y),
+        )
+    }
+
+    fn stop(pos: f32, r: u8, g: u8, b: u8, a: f32, brightness: f32) -> D2D1_GRADIENT_STOP {
+        let m = |v: u8| (v as f32 * brightness).round().clamp(0.0, 255.0) as u8;
+        D2D1_GRADIENT_STOP {
+            position: pos,
+            color: c(m(r), m(g), m(b), a),
+        }
+    }
+
+    /// `.pillbg` 的三层渐变（色相压中性灰 + 两团白高光），按亮度滤镜预生成。
+    fn pill(rt: &ID2D1RenderTarget, w: f32, h: f32, brightness: f32) -> Result<Pill> {
+        let (start, end) = Self::linear_172(w, h);
+        let base_stops = [
+            Self::stop(0.0, 243, 245, 248, 0.36, brightness),
+            Self::stop(0.46, 230, 233, 239, 0.22, brightness),
+            Self::stop(1.0, 221, 225, 232, 0.26, brightness),
+        ];
+        let r1_stops = [
+            Self::stop(0.0, 255, 255, 255, 0.28, brightness),
+            Self::stop(0.58, 255, 255, 255, 0.0, brightness),
+            Self::stop(1.0, 255, 255, 255, 0.0, brightness),
+        ];
+        let r2_stops = [
+            Self::stop(0.0, 255, 255, 255, 0.16, brightness),
+            Self::stop(0.62, 255, 255, 255, 0.0, brightness),
+            Self::stop(1.0, 255, 255, 255, 0.0, brightness),
+        ];
+        Ok(Pill {
+            base: Self::grad(rt, &base_stops, start, end)?,
+            r1: Self::radial(rt, &r1_stops, Vector2::new(w * 0.18, -h * 0.12), w * 1.2, h * 0.9)?,
+            r2: Self::radial(rt, &r2_stops, Vector2::new(w, 0.0), w * 0.9, h * 0.7)?,
+        })
     }
 
     fn p(&self, logical: f32) -> f32 {
@@ -306,6 +479,126 @@ impl Renderer {
             }
             Err(_) => 0.0,
         }
+    }
+
+    /// 胶囊数字用：tabular-nums（等宽数字）+ 可选字距。
+    fn layout_feat(
+        &self,
+        text: &str,
+        fmt: &IDWriteTextFormat,
+        tabular: bool,
+        tracking: f32,
+    ) -> Result<IDWriteTextLayout> {
+        let w = wide(text);
+        let lay = unsafe {
+            self.dwrite
+                .CreateTextLayout(&w[..w.len() - 1], fmt, self.p(600.0), self.p(160.0))?
+        };
+        if tabular || tracking != 0.0 {
+            let range = DWRITE_TEXT_RANGE {
+                startPosition: 0,
+                length: (w.len() - 1) as u32,
+            };
+            if let Ok(l1) = lay.cast::<IDWriteTextLayout1>() {
+                unsafe {
+                    if tabular {
+                        let _ = l1.SetTypography(&self.typo, range);
+                    }
+                    if tracking != 0.0 {
+                        let _ = l1.SetCharacterSpacing(0.0, tracking, 0.0, range);
+                    }
+                }
+            }
+        }
+        Ok(lay)
+    }
+
+    fn measure_feat(
+        &self,
+        text: &str,
+        fmt: &IDWriteTextFormat,
+        tabular: bool,
+        tracking: f32,
+    ) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        match self.layout_feat(text, fmt, tabular, tracking) {
+            Ok(lay) => {
+                let mut m = DWRITE_TEXT_METRICS::default();
+                unsafe {
+                    let _ = lay.GetMetrics(&mut m);
+                }
+                m.widthIncludingTrailingWhitespace
+            }
+            Err(_) => 0.0,
+        }
+    }
+
+    /// 单行文本按视觉行高垂直居中（对照 flex align-items:center）。
+    fn draw_text_vcentered(
+        &self,
+        rt: &ID2D1RenderTarget,
+        text: &str,
+        fmt: &IDWriteTextFormat,
+        x: f32,
+        cy: f32,
+        brush: &ID2D1Brush,
+        tabular: bool,
+        tracking: f32,
+    ) -> Result<f32> {
+        if text.is_empty() {
+            return Ok(0.0);
+        }
+        let lay = self.layout_feat(text, fmt, tabular, tracking)?;
+        let mut m = DWRITE_TEXT_METRICS::default();
+        unsafe {
+            lay.GetMetrics(&mut m)?;
+        }
+        unsafe {
+            rt.DrawTextLayout(
+                Vector2::new(x, cy - m.height / 2.0),
+                &lay,
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+            );
+        }
+        Ok(m.widthIncludingTrailingWhitespace)
+    }
+
+    /// 呼吸灯：实心圆 + 6 层同心圆近似 box-shadow 光晕。
+    fn draw_dot(&self, cx: f32, cy: f32, dot: &DotPaint) -> Result<()> {
+        let alpha = dot.alpha.clamp(0.0, 1.0);
+        let (r, g, b) = dot.rgb;
+        let core = self.p(3.0) * dot.scale;
+        let blur = if dot.glow > 0.4 { 6.0 } else { 5.0 };
+        let outer = core + self.p(blur);
+        let ring_alpha = dot.glow * alpha * 0.22;
+        unsafe {
+            for i in (0..6).rev() {
+                let t = (i as f32 + 1.0) / 6.0;
+                let rr = core + (outer - core) * t;
+                self.b_dot.SetColor(&c(r, g, b, ring_alpha));
+                self.rt.FillEllipse(
+                    &D2D1_ELLIPSE {
+                        point: Vector2::new(cx, cy),
+                        radiusX: rr,
+                        radiusY: rr,
+                    },
+                    &self.b_dot,
+                );
+            }
+            self.b_dot.SetColor(&c(r, g, b, alpha));
+            self.rt.FillEllipse(
+                &D2D1_ELLIPSE {
+                    point: Vector2::new(cx, cy),
+                    radiusX: core,
+                    radiusY: core,
+                },
+                &self.b_dot,
+            );
+        }
+        Ok(())
     }
 
     fn draw_globe(&self, cx: f32, cy: f32) -> Result<()> {
@@ -526,62 +819,324 @@ impl Renderer {
         Ok(())
     }
 
-    /// 岛态（T2 粗糙版）：一条圆角胶囊 + 下行速率文字。
-    /// 视觉复刻在 T3（呼吸灯、迷你数字、hover 放大）完成，这里只要三态可辨。
+    /// 胶囊态（T3）：144×34 DIP 玻璃胶囊 + 呼吸灯 + 迷你数字。
+    /// 静态层（玻璃/文字/发丝）画进独立 DIB；呼吸帧只做两次 GDI 拷贝：
+    /// BitBlt 静态层 → 主 DIB，AlphaBlend 预渲染的呼吸点相位帧。
+    /// 这样 15 fps 呼吸不再每帧触发 D2D 的 BeginDraw/EndDraw 与全表面渐变重绘。
     pub fn paint_island(&self, f: &Frame) -> Result<()> {
+        let (static_dc, dot_cx) = self.ensure_island_static(f)?;
+        self.ensure_dot_tiles(&f.dot)?;
+        let (tile, strip_dc, phase) = {
+            let cache = self.dot_tiles.borrow();
+            let t = cache.as_ref().unwrap();
+            (
+                t.tile,
+                t.surface.mem_dc,
+                f.dot.phase.min(island::BREATHE_PHASES - 1),
+            )
+        };
+        unsafe {
+            let _ = BitBlt(
+                self.mem_dc,
+                0,
+                0,
+                self.w as i32,
+                self.h as i32,
+                Some(static_dc),
+                0,
+                0,
+                SRCCOPY,
+            );
+            let left = (dot_cx - tile as f32 / 2.0).round() as i32;
+            let top = (self.h / 2.0 - tile as f32 / 2.0).round() as i32;
+            let blend = BLENDFUNCTION {
+                BlendOp: 0, // AC_SRC_OVER
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: 1, // AC_SRC_ALPHA
+            };
+            let _ = AlphaBlend(
+                self.mem_dc,
+                left,
+                top,
+                tile,
+                tile,
+                strip_dc,
+                phase as i32 * tile,
+                0,
+                tile,
+                tile,
+                blend,
+            );
+        }
+        Ok(())
+    }
+
+    fn island_static_key(f: &Frame) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            f.down_value, f.down_unit, f.up_value, f.up_unit, f.hover, f.active
+        )
+    }
+
+    /// 内容/悬停/按下没变时复用上一张静态 DIB；变了才重画一次。
+    fn ensure_island_static(&self, f: &Frame) -> Result<(HDC, f32)> {
+        let key = Self::island_static_key(f);
+        if let Some(c) = self.island_static.borrow().as_ref() {
+            if c.key == key {
+                return Ok((c.surface.mem_dc, c.dot_cx));
+            }
+        }
+        if self.island_static.borrow().is_none() {
+            *self.island_static.borrow_mut() = Some(IslandStatic {
+                key: String::new(),
+                dot_cx: 0.0,
+                surface: window::Surface::new(None, self.w as i32, self.h as i32)?,
+            });
+        }
+        let mut cache = self.island_static.borrow_mut();
+        let st = cache.as_mut().unwrap();
+        let dot_cx = self.redraw_island_static(st, f)?;
+        st.key = key;
+        st.dot_cx = dot_cx;
+        Ok((st.surface.mem_dc, dot_cx))
+    }
+
+    /// 画静态层（玻璃 + 迷你数字 + 内发丝），返回呼吸灯圆心 x。
+    fn redraw_island_static(&self, st: &mut IslandStatic, f: &Frame) -> Result<f32> {
         let w = self.w;
         let h = self.h;
+        let radius = island::capsule_radius(w, h, self.scale);
+        let body = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: w,
+                bottom: h,
+            },
+            radiusX: radius,
+            radiusY: radius,
+        };
+        let pill = if f.active {
+            &self.pill_active
+        } else if f.hover {
+            &self.pill_hot
+        } else {
+            &self.pill_normal
+        };
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: self.w as i32,
+            bottom: self.h as i32,
+        };
         unsafe {
-            self.rt.BeginDraw();
-            self.rt.Clear(Some(&c(0, 0, 0, 0.0)));
-            self.rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-            self.rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            self.rt.BindDC(st.surface.mem_dc, &rect)?;
+        }
+        let result = (|| -> Result<f32> {
+            unsafe {
+                self.rt.BeginDraw();
+                self.rt.Clear(Some(&c(0, 0, 0, 0.0)));
+                self.rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                self.rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+                self.rt.FillRoundedRectangle(&body, &pill.base);
+                self.rt.FillRoundedRectangle(&body, &pill.r1);
+                self.rt.FillRoundedRectangle(&body, &pill.r2);
+            }
 
-            let radius = h / 2.0;
-            let body = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F {
-                    left: 0.0,
-                    top: 0.0,
-                    right: w,
-                    bottom: h,
-                },
-                radiusX: radius,
-                radiusY: radius,
-            };
-            let glass: &ID2D1LinearGradientBrush = if f.hover { &self.b_glass_hover } else { &self.b_glass };
-            self.rt.FillRoundedRectangle(&body, glass);
-
-            // 静态呼吸点：DC 行为，不逐帧出帧（D1 的视觉换功耗）。
-            let dot = D2D1_ELLIPSE {
-                point: Vector2::new(self.p(13.0), h / 2.0),
-                radiusX: self.p(3.2),
-                radiusY: self.p(3.2),
-            };
-            self.rt.FillEllipse(&dot, &self.b_line);
-
-            let text = format!("↓ {} {}", f.down_value, f.down_unit);
-            let tw = self.measure(&text, &self.f_foot);
-            self.draw_text(
-                &text,
-                &self.f_foot,
-                w - self.p(13.0) - tw,
-                h / 2.0 + self.p(4.0),
+            // 迷你一行：点 + 5px + 下行数字 + 单位 + 上行，整体水平居中。
+            let gap = self.p(5.0);
+            let up = format!("↑ {} {}", f.up_value, f.up_unit);
+            let down_w = self.measure_feat(&f.down_value, &self.f_mdown, true, -0.3 * self.scale);
+            let unit_w = self.measure_feat(&f.down_unit, &self.f_munit, false, 0.0);
+            let up_w = self.measure_feat(&up, &self.f_mup, true, 0.0);
+            let total = self.p(6.0) + gap + down_w + gap + unit_w + gap + up_w;
+            let mut x = (w - total) / 2.0;
+            let cy = h / 2.0;
+            let dot_cx = x + self.p(3.0);
+            x += self.p(6.0) + gap;
+            self.draw_text_vcentered(
+                &self.rt,
+                &f.down_value,
+                &self.f_mdown,
+                x,
+                cy,
                 &self.b_ink,
+                true,
+                -0.3 * self.scale,
             )?;
+            x += down_w + gap;
+            self.draw_text_vcentered(
+                &self.rt,
+                &f.down_unit,
+                &self.f_munit,
+                x,
+                cy,
+                &self.b_ink6,
+                false,
+                0.0,
+            )?;
+            x += unit_w + gap;
+            self.draw_text_vcentered(&self.rt, &up, &self.f_mup, x, cy, &self.b_ink55, true, 0.0)?;
 
+            // 内发丝：0.5px 白 .72 描边 + 顶部 0.5px 白 .85 高光。
+            let inset = self.p(0.25);
             let rim = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F {
-                    left: self.p(0.5),
-                    top: self.p(0.5),
-                    right: w - self.p(0.5),
-                    bottom: h - self.p(0.5),
+                    left: inset,
+                    top: inset,
+                    right: w - inset,
+                    bottom: h - inset,
                 },
-                radiusX: radius,
-                radiusY: radius,
+                radiusX: (radius - inset).max(0.0),
+                radiusY: (radius - inset).max(0.0),
             };
-            self.rt.DrawRoundedRectangle(&rim, &self.b_white, self.p(0.6), None);
-            self.rt.EndDraw(None, None)?;
+            unsafe {
+                self.rt
+                    .DrawRoundedRectangle(&rim, &self.b_hair72, self.p(0.5), None);
+                self.rt.DrawLine(
+                    Vector2::new(radius, inset),
+                    Vector2::new(w - radius, inset),
+                    &self.b_hair85,
+                    self.p(0.5),
+                    None,
+                );
+                self.rt.EndDraw(None, None)?;
+            }
+            Ok(dot_cx)
+        })();
+        unsafe {
+            self.rt.BindDC(self.mem_dc, &rect)?;
         }
+        result
+    }
+
+    /// 预渲染 32 个呼吸相位帧（颜色/光晕变了才重画），存成一条位图。
+    fn ensure_dot_tiles(&self, dot: &DotPaint) -> Result<()> {
+        let key = format!("{},{},{},{:.3}", dot.rgb.0, dot.rgb.1, dot.rgb.2, dot.glow);
+        let blur = if dot.glow > 0.4 { 6.0 } else { 5.0 };
+        let tile = ((3.0 + blur) * 2.0 * self.scale).ceil() as i32 + 2;
+        {
+            let cache = self.dot_tiles.borrow();
+            if let Some(t) = cache.as_ref() {
+                if t.key == key && t.tile == tile {
+                    return Ok(());
+                }
+            }
+        }
+        let mut cache = self.dot_tiles.borrow_mut();
+        let resize = cache.as_ref().map(|t| t.tile != tile).unwrap_or(true);
+        if resize {
+            *cache = Some(DotTiles {
+                key: String::new(),
+                tile,
+                surface: window::Surface::new(
+                    None,
+                    tile * island::BREATHE_PHASES as i32,
+                    tile,
+                )?,
+            });
+        }
+        let t = cache.as_mut().unwrap();
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: tile * island::BREATHE_PHASES as i32,
+            bottom: tile,
+        };
+        unsafe {
+            self.rt.BindDC(t.surface.mem_dc, &rect)?;
+        }
+        let result = (|| -> Result<()> {
+            unsafe {
+                self.rt.BeginDraw();
+                self.rt.Clear(Some(&c(0, 0, 0, 0.0)));
+                self.rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            }
+            for i in 0..island::BREATHE_PHASES {
+                let (alpha, scale) = island::breathe_at(
+                    i as f64 / island::BREATHE_PHASES as f64 * 2000.0,
+                );
+                let m = Matrix3x2::translation((i as i32 * tile) as f32, 0.0);
+                unsafe {
+                    self.rt.SetTransform(&m);
+                }
+                self.draw_dot(
+                    tile as f32 / 2.0,
+                    tile as f32 / 2.0,
+                    &DotPaint {
+                        rgb: dot.rgb,
+                        glow: dot.glow,
+                        alpha,
+                        scale,
+                        phase: i,
+                    },
+                )?;
+            }
+            unsafe {
+                self.rt.SetTransform(&Matrix3x2::identity());
+                self.rt.EndDraw(None, None)?;
+            }
+            Ok(())
+        })();
+        unsafe {
+            self.rt.BindDC(self.mem_dc, &rect)?;
+        }
+        t.key = key;
+        result
+    }
+
+    /// 岛态绘制成本分解（--bench）：GDI 静态层 BitBlt + 呼吸点 AlphaBlend。
+    pub fn bench_island_parts(&self, f: &Frame) -> Result<()> {
+        let (static_dc, dot_cx) = self.ensure_island_static(f)?;
+        self.ensure_dot_tiles(&f.dot)?;
+        let (tile, strip_dc) = {
+            let cache = self.dot_tiles.borrow();
+            let t = cache.as_ref().unwrap();
+            (t.tile, t.surface.mem_dc)
+        };
+        let n = 300;
+        let left = (dot_cx - tile as f32 / 2.0).round() as i32;
+        let top = (self.h / 2.0 - tile as f32 / 2.0).round() as i32;
+        let blend = BLENDFUNCTION {
+            BlendOp: 0,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: 1,
+        };
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            unsafe {
+                let _ = BitBlt(
+                    self.mem_dc,
+                    0,
+                    0,
+                    self.w as i32,
+                    self.h as i32,
+                    Some(static_dc),
+                    0,
+                    0,
+                    SRCCOPY,
+                );
+                let _ = AlphaBlend(
+                    self.mem_dc,
+                    left,
+                    top,
+                    tile,
+                    tile,
+                    strip_dc,
+                    (i % island::BREATHE_PHASES as usize) as i32 * tile,
+                    0,
+                    tile,
+                    tile,
+                    blend,
+                );
+            }
+        }
+        eprintln!(
+            "  gdi blit+tile        {:.4} ms",
+            t.elapsed().as_secs_f64() * 1000.0 / n as f64
+        );
         Ok(())
     }
 

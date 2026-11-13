@@ -28,6 +28,24 @@ pub fn dpi_scale() -> f32 {
     unsafe { GetDpiForSystem() as f32 / 96.0 }
 }
 
+/// 屏幕 DC 缓存：ULW 每帧都要一个屏幕 DC，反复 GetDC/ReleaseDC 在 15 fps
+/// 呼吸路径上是可见开销。进程退出时由系统回收，不需要手动释放。
+fn screen_dc() -> HDC {
+    use std::cell::Cell;
+    thread_local! {
+        static CACHE: Cell<isize> = const { Cell::new(0) };
+    }
+    CACHE.with(|c| {
+        let v = c.get();
+        if v != 0 {
+            return HDC(v as *mut c_void);
+        }
+        let dc = unsafe { GetDC(None) };
+        c.set(dc.0 as isize);
+        dc
+    })
+}
+
 /// A 32bpp premultiplied-ARGB DIB with its memory DC -- the surface that both
 /// Direct2D (as a DC render target) and UpdateLayeredWindow consume.
 pub struct Surface {
@@ -101,7 +119,8 @@ impl Surface {
                 SourceConstantAlpha: 255,
                 AlphaFormat: 1, // AC_SRC_ALPHA
             };
-            let screen = GetDC(None);
+            // 每帧 GetDC/ReleaseDC 是可见开销（15 fps 呼吸）；缓存屏幕 DC。
+            let screen = screen_dc();
             let r = UpdateLayeredWindow(
                 hwnd,
                 Some(screen),
@@ -113,7 +132,6 @@ impl Surface {
                 Some(&blend),
                 ULW_ALPHA,
             );
-            ReleaseDC(None, screen);
             r
         }
     }

@@ -73,13 +73,22 @@ pub const POLL: Duration = Duration::from_millis(260);
 /// 前台窗口 → 形态的纯决策状态机。时间由调用方注入，便于按 260ms 轮询节奏单测。
 pub struct ModeGate {
     desktop_since: Option<Instant>,
+    /// D6：托盘手动隐藏。为 true 时任何前台变化（桌面稳定、全屏 App 路过、
+    /// 退出全屏）都不得重显；只有托盘"显示"或手动展开才清零。
+    manual_hidden: bool,
 }
 
 impl ModeGate {
     pub fn new() -> Self {
         Self {
             desktop_since: None,
+            manual_hidden: false,
         }
+    }
+
+    /// 托盘隐藏 / 恢复。T6 的托盘菜单接线；`--mode=hidden` 诊断也走这里。
+    pub fn set_manual_hidden(&mut self, hidden: bool) {
+        self.manual_hidden = hidden;
     }
 
     pub fn decide(&mut self, now: Instant, s: FgSnapshot) -> UiMode {
@@ -90,6 +99,10 @@ impl ModeGate {
             // 任务栏/Alt+Tab 覆盖层只是路过，既不算离开桌面，也不启动计时
             FgKind::ShellTransient => {}
             FgKind::App => self.desktop_since = None,
+        }
+        // D6：手动隐藏期间前台怎么变都不重显（全屏路过也不打断隐藏）。
+        if self.manual_hidden {
+            return UiMode::Hidden;
         }
         if s.kind == FgKind::App && s.fullscreen {
             return UiMode::Hidden;
@@ -118,6 +131,22 @@ pub enum IslandAnchor {
     Right,
 }
 
+pub fn anchor_code(anchor: IslandAnchor) -> u8 {
+    match anchor {
+        IslandAnchor::Center => 0,
+        IslandAnchor::Left => 1,
+        IslandAnchor::Right => 2,
+    }
+}
+
+pub fn anchor_from_code(code: u8) -> IslandAnchor {
+    match code {
+        1 => IslandAnchor::Left,
+        2 => IslandAnchor::Right,
+        _ => IslandAnchor::Center,
+    }
+}
+
 // 逻辑像素（DIP）尺寸，全部按 scale 放大成物理像素后落窗。
 pub const CARD_W: f64 = 320.0;
 pub const CARD_H: f64 = 200.0;
@@ -141,6 +170,9 @@ pub struct Layout {
     pub home: (i32, i32),
     pub hot: bool,
     pub anchor: IslandAnchor,
+    /// 诊断用（`--island-pos X,Y`）：把胶囊钉在指定位置，方便截图/测量时
+    /// 避开常驻 WebView 版；正常启动为 None，行为不变。
+    pub island_pos: Option<(i32, i32)>,
 }
 
 impl Layout {
@@ -167,6 +199,11 @@ impl Layout {
         let w = (lw * self.scale as f64).round() as i32;
         let h = (lh * self.scale as f64).round() as i32;
         let edge = (EDGE * self.scale as f64).round() as i32;
+        if let Some((ox, oy)) = self.island_pos {
+            // 悬浮放大以基础胶囊中心为轴：窗口横向变宽、顶边不动。
+            let base_w = (ISLAND_W * self.scale as f64).round() as i32;
+            return anim::Rect::new(ox - (w - base_w) / 2, oy, w, h);
+        }
         let x = match self.anchor {
             IslandAnchor::Center => (self.screen.w - w) / 2,
             IslandAnchor::Left => self.screen.x + edge,
@@ -231,6 +268,9 @@ pub fn pick_anchor(
 
 /// 躲到屏幕角落：大位移纯平移。阻尼取高值，回弹再好看也不能冲出屏幕边缘。
 pub const DODGE_MOTION: anim::Motion = anim::Motion::new(0.34, 0.92);
+
+/// 岛态 hover 弹簧放大（162×42），阻尼低、带回弹（对照 island_hover）。
+pub const HOVER_MOTION: anim::Motion = anim::Motion::new(0.30, 0.55);
 
 /// 展开：略软、带回弹（damping < 1）；收回：更快、几乎不过冲。
 pub fn motion_for(mode: UiMode) -> anim::Motion {
@@ -536,6 +576,47 @@ mod tests {
         assert_eq!(back, UiMode::Island);
     }
 
+    // ---- D6：托盘隐藏持久化，全屏路过不重显 ----
+
+    #[test]
+    fn manual_hidden_persists_through_desktop_and_fullscreen() {
+        let t0 = Instant::now();
+        let mut g = ModeGate::new();
+        g.set_manual_hidden(true);
+
+        // 桌面稳定 5 秒也不应自动展开
+        for i in 0..20 {
+            let m = g.decide(t0 + TICK * i, snap(FgKind::Desktop));
+            assert_eq!(m, UiMode::Hidden, "托盘隐藏必须压过桌面展开：{i}");
+        }
+        // 全屏 App 路过、退出全屏回到普通 App 都不应重显
+        let full = g.decide(
+            t0 + TICK * 21,
+            FgSnapshot {
+                fullscreen: true,
+                ..snap(FgKind::App)
+            },
+        );
+        assert_eq!(full, UiMode::Hidden);
+        let after = g.decide(t0 + TICK * 22, snap(FgKind::App));
+        assert_eq!(after, UiMode::Hidden, "全屏路过不重显");
+
+        // 托盘恢复后行为回到正常状态机（中途离开过桌面，需要重新 settle → 胶囊）
+        g.set_manual_hidden(false);
+        assert_eq!(g.decide(t0 + TICK * 23, snap(FgKind::Desktop)), UiMode::Island);
+        assert_eq!(g.decide(t0 + TICK * 32, snap(FgKind::Desktop)), UiMode::Expanded);
+    }
+
+    #[test]
+    fn manual_show_on_app_returns_island() {
+        let t0 = Instant::now();
+        let mut g = ModeGate::new();
+        g.set_manual_hidden(true);
+        assert_eq!(g.decide(t0, snap(FgKind::App)), UiMode::Hidden);
+        g.set_manual_hidden(false);
+        assert_eq!(g.decide(t0 + TICK, snap(FgKind::App)), UiMode::Island);
+    }
+
     // ---- 以下为 T2 新增：布局与 --silent 显隐决策 ----
 
     fn layout(anchor: IslandAnchor, hot: bool) -> Layout {
@@ -545,7 +626,21 @@ mod tests {
             home: (1000, 300),
             hot,
             anchor,
+            island_pos: None,
         }
+    }
+
+    #[test]
+    fn island_pos_override_centers_hot_growth() {
+        let mut l = layout(IslandAnchor::Center, false);
+        l.island_pos = Some((100, 900));
+        assert_eq!(l.island(), rect(100, 900, 216, 51));
+        l.hot = true;
+        assert_eq!(
+            l.island(),
+            rect(100 - (243 - 216) / 2, 900, 243, 63),
+            "放大以基础胶囊中心为轴"
+        );
     }
 
     #[test]
