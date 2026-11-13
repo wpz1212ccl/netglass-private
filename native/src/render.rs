@@ -165,6 +165,8 @@ pub struct Renderer {
     dot_tiles: RefCell<Option<DotTiles>>,
     /// 曲线离屏缓存：hist 变了才重画一次，hover 淡出只改合成透明度。
     chart: RefCell<Option<ChartCache>>,
+    /// 静态卡片底（玻璃 5 层 + 内发丝）：只随 hover 亮度档变化，缓存成位图。
+    card_bg: RefCell<Option<CardBg>>,
 }
 
 struct IslandStatic {
@@ -177,6 +179,12 @@ struct DotTiles {
     key: String,
     tile: i32,
     surface: window::Surface,
+}
+
+struct CardBg {
+    mix: usize,
+    target: ID2D1BitmapRenderTarget,
+    bitmap: ID2D1Bitmap,
 }
 
 struct ChartCache {
@@ -426,6 +434,7 @@ impl Renderer {
             island_static: RefCell::new(None),
             dot_tiles: RefCell::new(None),
             chart: RefCell::new(None),
+            card_bg: RefCell::new(None),
         })
     }
 
@@ -1140,6 +1149,8 @@ impl Renderer {
         })
     }
 
+    /// 把曲线画进离屏位图，同时把左右 26px 渐隐 mask 烘进去（1 Hz 重建一次）。
+    /// 之后每帧只需一次 DrawBitmap，hover 淡出只改统一 opacity。
     fn build_chart(&self, cache: &mut ChartCache, f: &Frame) -> Result<()> {
         let (cw, ch) = self.chart_size();
         let vy = |v: f32| v / 66.0 * ch;
@@ -1152,28 +1163,89 @@ impl Renderer {
             target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
         let flat = f.hist.iter().cloned().fold(0.0f64, f64::max) < 1024.0;
-        if flat {
-            unsafe {
-                target.DrawLine(
-                    Vector2::new(0.0, vy(57.6)),
-                    Vector2::new(cw, vy(57.6)),
-                    &cache.base,
-                    self.p(0.6),
-                    None,
-                );
-            }
+        let (line, area) = if flat {
+            (None, None)
         } else {
-            let (line, area) = self.spark_geometry(&f.hist, 0.0, cw, top, base, ch)?;
+            let (l, a) = self.spark_geometry(&f.hist, 0.0, cw, top, base, ch)?;
+            (Some(l), Some(a))
+        };
+        let draw = |op: f32| -> Result<()> {
             unsafe {
-                cache.area.SetStartPoint(Vector2::new(0.0, 0.0));
-                cache.area.SetEndPoint(Vector2::new(0.0, ch));
-                target.FillGeometry(&area, &cache.area, None);
-                cache.line.SetStartPoint(Vector2::new(0.0, 0.0));
-                cache.line.SetEndPoint(Vector2::new(cw, 0.0));
-                target.DrawGeometry(&line, &cache.line, self.p(1.5), &self.caps);
+                cache.base.SetOpacity(op);
+                if let Some(a) = &area {
+                    cache.area.SetOpacity(op);
+                    target.FillGeometry(a, &cache.area, None);
+                }
+                if let Some(l) = &line {
+                    cache.line.SetOpacity(op);
+                    target.DrawGeometry(l, &cache.line, self.p(1.5), &self.caps);
+                }
             }
+            if flat {
+                unsafe {
+                    target.DrawLine(
+                        Vector2::new(0.0, vy(57.6)),
+                        Vector2::new(cw, vy(57.6)),
+                        &cache.base,
+                        self.p(0.6),
+                        None,
+                    );
+                }
+            }
+            Ok(())
+        };
+        let fade = (26.0 * self.scale).round().max(1.0);
+        let band = 2.0f32;
+        let mut x = 0.0f32;
+        while x < fade {
+            let x1 = (x + band).min(fade);
+            let mask = ((x + x1) / 2.0 / fade).clamp(0.0, 1.0);
+            let clip = D2D_RECT_F {
+                left: x,
+                top: 0.0,
+                right: x1,
+                bottom: ch,
+            };
+            unsafe {
+                target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
+            }
+            draw(mask)?;
+            unsafe {
+                target.PopAxisAlignedClip();
+            }
+            x = x1;
         }
+        let mut x = 0.0f32;
+        while x < fade {
+            let x1 = (x + band).min(fade);
+            let mask = ((x + x1) / 2.0 / fade).clamp(0.0, 1.0);
+            let clip = D2D_RECT_F {
+                left: cw - fade + x,
+                top: 0.0,
+                right: cw - fade + x1,
+                bottom: ch,
+            };
+            unsafe {
+                target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
+            }
+            draw(mask)?;
+            unsafe {
+                target.PopAxisAlignedClip();
+            }
+            x = x1;
+        }
+        let clip = D2D_RECT_F {
+            left: fade,
+            top: 0.0,
+            right: cw - fade,
+            bottom: ch,
+        };
         unsafe {
+            target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
+        }
+        draw(1.0)?;
+        unsafe {
+            target.PopAxisAlignedClip();
             target.EndDraw(None, None)?;
         }
         cache.bitmap = unsafe { target.GetBitmap()? };
@@ -1200,8 +1272,84 @@ impl Renderer {
         Ok(())
     }
 
-    /// 曲线 + 左右 26px 渐隐 mask。曲线先画进离屏位图，再用逐段 opacity 合成，
-    /// 1 Hz 重建一次，hover 淡出只改每段透明度。
+    /// 静态卡片底：5 层玻璃 + 内发丝。软件 D2D 的 radial/linear 渐变全表面
+    /// 填充约 4–5 ms，缓存成位图后每帧只剩一次 DrawBitmap。
+    fn ensure_card_bg(&self, mix: usize) -> Result<()> {
+        if let Some(b) = self.card_bg.borrow().as_ref() {
+            if b.mix == mix {
+                return Ok(());
+            }
+        }
+        let mut cache = self.card_bg.borrow_mut();
+        if cache.is_none() {
+            let size = D2D_SIZE_F {
+                width: self.w,
+                height: self.h,
+            };
+            let target = unsafe {
+                self.rt.CreateCompatibleRenderTarget(
+                    Some(&size),
+                    None,
+                    None,
+                    D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,
+                )?
+            };
+            let bitmap = unsafe { target.GetBitmap()? };
+            *cache = Some(CardBg {
+                mix: usize::MAX,
+                target,
+                bitmap,
+            });
+        }
+        let b = cache.as_mut().unwrap();
+        let target = &b.target;
+        unsafe {
+            target.BeginDraw();
+            target.Clear(Some(&c(0, 0, 0, 0.0)));
+            target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            target.FillGeometry(&self.card_path, &self.glass[mix], None);
+            target.FillGeometry(&self.card_path, &self.b_hl1, None);
+            target.FillGeometry(&self.card_path, &self.b_hl2, None);
+            target.FillGeometry(&self.card_path, &self.b_blue, None);
+            target.FillGeometry(&self.card_path, &self.b_bottom, None);
+            target.DrawGeometry(&self.card_rim, &self.b_hair72, self.p(0.5), None);
+            target.DrawLine(
+                Vector2::new(self.p(card::RADIUS), self.p(0.25)),
+                Vector2::new(self.w - self.p(card::RADIUS), self.p(0.25)),
+                &self.b_hair85,
+                self.p(0.5),
+                None,
+            );
+            target.EndDraw(None, None)?;
+        }
+        b.bitmap = unsafe { target.GetBitmap()? };
+        b.mix = mix;
+        Ok(())
+    }
+
+    fn draw_card_bg(&self, mix: usize) -> Result<()> {
+        self.ensure_card_bg(mix)?;
+        let cache = self.card_bg.borrow();
+        let b = cache.as_ref().unwrap();
+        let dest = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: self.w,
+            bottom: self.h,
+        };
+        unsafe {
+            self.rt.DrawBitmap(
+                &b.bitmap,
+                Some(&dest),
+                1.0,
+                D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// 曲线：mask 已在重建时烘进位图，这里只做一次带统一 opacity 的合成。
     fn draw_chart(&self, f: &Frame) -> Result<()> {
         let alpha = f.hover_fx.chart_alpha;
         if alpha <= 0.002 {
@@ -1217,70 +1365,14 @@ impl Renderer {
             right: left + cw,
             bottom: top + ch,
         };
-        let fade = (26.0 * self.scale).round().max(1.0);
-        let band = 2.0f32;
-        let mut x = 0.0f32;
-        while x < fade {
-            let x1 = (x + band).min(fade);
-            let mask = ((x + x1) / 2.0 / fade).clamp(0.0, 1.0);
-            let clip = D2D_RECT_F {
-                left: left + x,
-                top,
-                right: left + x1,
-                bottom: top + ch,
-            };
-            unsafe {
-                self.rt.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
-                self.rt.DrawBitmap(
-                    &c.bitmap,
-                    Some(&dest),
-                    alpha * mask,
-                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                    None,
-                );
-                self.rt.PopAxisAlignedClip();
-            }
-            x = x1;
-        }
-        let mut x = 0.0f32;
-        while x < fade {
-            let x1 = (x + band).min(fade);
-            let mask = ((x + x1) / 2.0 / fade).clamp(0.0, 1.0);
-            let clip = D2D_RECT_F {
-                left: left + cw - fade + x,
-                top,
-                right: left + cw - fade + x1,
-                bottom: top + ch,
-            };
-            unsafe {
-                self.rt.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
-                self.rt.DrawBitmap(
-                    &c.bitmap,
-                    Some(&dest),
-                    alpha * mask,
-                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                    None,
-                );
-                self.rt.PopAxisAlignedClip();
-            }
-            x = x1;
-        }
-        let clip = D2D_RECT_F {
-            left: left + fade,
-            top,
-            right: left + cw - fade,
-            bottom: top + ch,
-        };
         unsafe {
-            self.rt.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
             self.rt.DrawBitmap(
                 &c.bitmap,
                 Some(&dest),
                 alpha,
-                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
                 None,
             );
-            self.rt.PopAxisAlignedClip();
         }
         Ok(())
     }
@@ -1318,33 +1410,14 @@ impl Renderer {
             self.rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         }
 
-        // 1. 玻璃：172° 主渐变 + 两团 radial 高光 + 底部蓝/暗角。
+        // 1. 玻璃 + 内发丝（缓存位图，只有 hover 亮度档变化才重画）。
         let mix = (fx.glass.clamp(0.0, 1.0) * 8.0).round() as usize;
-        unsafe {
-            self.rt.FillGeometry(&self.card_path, &self.glass[mix], None);
-            self.rt.FillGeometry(&self.card_path, &self.b_hl1, None);
-            self.rt.FillGeometry(&self.card_path, &self.b_hl2, None);
-            self.rt.FillGeometry(&self.card_path, &self.b_blue, None);
-            self.rt.FillGeometry(&self.card_path, &self.b_bottom, None);
-        }
+        self.draw_card_bg(mix)?;
 
-        // 2. 内发丝：0.5px 白 .72 描边 + 顶部 0.5px 白 .85 高光（inset 在形状内）。
-        unsafe {
-            self.rt
-                .DrawGeometry(&self.card_rim, &self.b_hair72, self.p(0.5), None);
-            self.rt.DrawLine(
-                Vector2::new(self.p(card::RADIUS), self.p(0.25)),
-                Vector2::new(w - self.p(card::RADIUS), self.p(0.25)),
-                &self.b_hair85,
-                self.p(0.5),
-                None,
-            );
-        }
-
-        // 3. 曲线（在 .inner 下面）。
+        // 2. 曲线（在 .inner 下面）。
         self.draw_chart(f)?;
 
-        // 4. 内容：整体随 hover 上浮 1px。
+        // 3. 内容：整体随 hover 上浮 1px。
         let dy = self.p(fx.inner_dy);
         let left = self.p(card::PAD_X);
         let right = w - self.p(card::PAD_X);
