@@ -5,7 +5,8 @@
 //! hit-testing for free.
 //!
 //! 形态由 `mode.rs` 的 260 ms 前台轮询状态机决定（expanded / island / hidden），
-//! 形变由 `anim.rs` 的弹簧线程推进，每帧通过 ULW 的 pptDst+psize 落位。
+//! 形变由 `anim.rs` 的弹簧线程推进：每帧「纯形状重绘 → ULW(psize=当前矩形)」，
+//! 中间帧没有文字（`.morphing` 语义，见 `morph.rs`）。
 //!
 //! Modes:
 //!   (no args)              run the widget
@@ -14,13 +15,19 @@
 //!   --pixels X,Y[;X,Y…]    print screen RGB at physical coordinates
 //!   --hit X,Y[;X,Y…]       WindowFromPoint identity at physical coordinates
 //!   --selftest             render offscreen, report DIB alpha inside/outside the shape
+//!   --morph-frame MS       定格形变中间帧（配 --morph-dir=expand|collapse 取证）
+//!   --morph-demo           诊断：真实 apply_mode 路径上交替展开/收回（几何连续性取证）
+//!   --show-after MS        诊断：起手隐藏，MS 后走真实路径显示初始形态（恢复首帧取证）
 
 mod anim;
 mod card;
 mod font;
 mod fx;
+mod input;
 mod island;
 mod mode;
+mod morph;
+mod number;
 mod netmon;
 mod probe;
 mod render;
@@ -51,6 +58,14 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const TIMER_BREATHE: usize = 1;
 /// 展开态 hover 详情时间轴定时器 id（16 ms，只在动画进行中运行）。
 const TIMER_HOVER: usize = 2;
+/// 数字弹簧定时器 id（16 ms，只在动画进行中运行；渲染另有 30 fps 闸）。
+const TIMER_NUM: usize = 3;
+/// 隐藏/显示 220 ms 淡出淡入定时器 id。
+const TIMER_FADE: usize = 4;
+/// 形变看门狗定时器 id（16 ms，判内容进场与形变收尾）。
+const TIMER_MORPH: usize = 5;
+/// 形变保险丝：弹簧异常时也必须收尾，不能卡在中间帧。
+const MORPH_TIMEOUT_MS: u64 = 2000;
 
 /// 实际显示形态。apply_mode 维护；形态线程写、UI 线程读。
 static MODE: AtomicU8 = AtomicU8::new(0);
@@ -58,6 +73,11 @@ static MODE: AtomicU8 = AtomicU8::new(0);
 /// 否则两边各算一套 target，切换时胶囊会跳回居中/缩回原尺寸。
 static ANCHOR: AtomicU8 = AtomicU8::new(0);
 static HOT: AtomicU8 = AtomicU8::new(0);
+/// 手动展开的 8 秒 pin（对照 `expand_temporarily`）：形态线程读它决定是否保持展开。
+static PIN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+static PIN_FG: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// 双击收回后的手动胶囊态（对照 `MANUAL_ISLAND`）：压过桌面 2 s settle。
+static MANUAL_ISLAND: AtomicU8 = AtomicU8::new(0);
 
 /// 几何线程待呈现的矩形（UI 线程在 WM_APP_GEOMETRY 里取走）。
 static PENDING: Mutex<Option<anim::Rect>> = Mutex::new(None);
@@ -113,6 +133,13 @@ fn main() {
     if args.iter().any(|a| a == "--selftest") {
         if let Err(e) = selftest() {
             eprintln!("selftest failed: {e:?}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(ms) = parse_morph_frame(&args) {
+        if let Err(e) = morph_frame(ms, &args) {
+            eprintln!("morph-frame failed: {e:?}");
             std::process::exit(1);
         }
         return;
@@ -192,6 +219,52 @@ struct App {
     hover_anim: fx::HoverAnim,
     hover_timer_on: bool,
     hover_t0: Instant,
+
+    /// 数字弹簧（P3-7）：目标值是原始字节速率，显示时再格式化。
+    numbers: number::NumberAnim,
+    number_timer_on: bool,
+    num_t0: Instant,
+    num_last: Instant,
+    /// 上行/下行当前显示的字节速率（未取整），供 content_key 判重。
+    rate_down: f64,
+    rate_up: f64,
+
+    /// 形变状态机（P3-6）：None = 静止。
+    morph: Option<Morph>,
+    morph_timer_on: bool,
+    morph_alpha_step: u8,
+    /// 形变中间帧的纯形状绘制器（按当前矩形重画，不缩放整张卡片）。
+    shapes: Option<render::ShapePainter>,
+    /// 隐藏/显示淡出（0..=255 全局 alpha，`FADE_MS` 内线性）。
+    fade: Option<Fade>,
+    fade_timer_on: bool,
+
+    /// 最近一次左键抬起（双击判定用）与单调时钟基准。
+    last_click: Option<input::Click>,
+    click_t0: Instant,
+    /// 按下起点与当前矩形（拖动阈值 / 点击判定）。
+    press: Option<(POINT, i32, i32)>,
+    press_moved: bool,
+}
+
+/// 一次形变：起点/终点矩形 + 形状弹簧与内容时间轴。
+struct Morph {
+    from: anim::Rect,
+    to: anim::Rect,
+    /// 目标形态（进场延迟与弹簧 delay 都由它决定）。
+    target: mode::UiMode,
+    t0: Instant,
+    /// 最近一帧的几何（几何线程回报，内容进场判据要读它）。
+    cur: anim::Rect,
+    /// 进场起点（相对 t0 的毫秒数）：None = 还在退场/纯形状阶段。
+    enter_at: Option<f64>,
+}
+
+/// 隐藏/显示的 220 ms 淡出（`.card.out`）。
+struct Fade {
+    t0: Instant,
+    /// true = 淡出到 0 后隐藏；false = 从 0 淡入。
+    out: bool,
 }
 
 impl App {
@@ -241,11 +314,35 @@ impl App {
                 scale,
                 phase,
             },
+            content_alpha: self.content_alpha(),
+        }
+    }
+
+    /// 内容不透明度：退场（旧内容淡出）→ 0（纯形状）→ 进场（新内容淡入）。
+    /// 不在形变中时恒为 1。
+    fn content_alpha(&self) -> f32 {
+        let Some(m) = &self.morph else {
+            return 1.0;
+        };
+        let t = m.t0.elapsed().as_secs_f64() * 1000.0;
+        match m.enter_at {
+            None => morph::fade_out_alpha(t, m.target),
+            Some(at) => morph::content_in_alpha(t - at),
         }
     }
 
     fn current_mode(&self) -> mode::UiMode {
         mode::mode_from_code(self.applied)
+    }
+
+    /// 交互判定用的形态：形变途中以**目标**形态为准。
+    /// `applied` 要等内容进场才切（中间帧仍按旧形态画），但点击/拖动发生在
+    /// 途中时，用户看到的是正在变过去的那一态。
+    fn effective_mode(&self) -> mode::UiMode {
+        match &self.morph {
+            Some(m) => m.target,
+            None => self.current_mode(),
+        }
     }
 
     fn repaint(&self) {
@@ -261,10 +358,88 @@ impl App {
 
     /// 按 ULW 的 pptDst+psize 落位：形变期间尺寸来自弹簧，不碰 SetWindowPos。
     fn present_rect(&self, r: anim::Rect) {
-        let _ = self.ui.surface.present_rect(r.x, r.y, r.w, r.h);
+        let alpha = self.fade_alpha();
+        let _ = self
+            .ui
+            .surface
+            .present_rect_alpha(r.x, r.y, r.w, r.h, alpha);
         if let Ok(mut g) = PRESENTED.lock() {
             *g = r;
         }
+    }
+
+    /// 淡出/淡入的全局 alpha（无淡出时 255）。
+    fn fade_alpha(&self) -> u8 {
+        let Some(f) = &self.fade else {
+            return 255;
+        };
+        let k = (f.t0.elapsed().as_secs_f64() * 1000.0 / morph::FADE_MS).clamp(0.0, 1.0);
+        let a = if f.out { 1.0 - k } else { k };
+        (a * 255.0).round() as u8
+    }
+
+    /// 形变中间帧：按当前矩形重画纯形状再 ULW（psize=当前矩形，1:1 不缩放）。
+    fn paint_shape_frame(&mut self, r: anim::Rect) {
+        let Some(m) = &self.morph else {
+            return;
+        };
+        let (from_w, to_w) = (m.from.w, m.to.w);
+        let radius = morph::morph_frame_radius(r, from_w, to_w, self.scale);
+        if self.shapes.is_none() {
+            let (w, h) = self.shape_buffer();
+            match render::ShapePainter::new(w, h, self.scale) {
+                Ok(s) => self.shapes = Some(s),
+                Err(e) => {
+                    log_line(&format!("shape painter err {e:?}"));
+                    return;
+                }
+            }
+        }
+        let alpha = self.fade_alpha();
+        let hwnd = self.hwnd;
+        let shapes = self.shapes.as_ref().unwrap();
+        if let Err(e) = shapes.paint(r.w, r.h, radius) {
+            log_line(&format!("shape paint err {e:?}"));
+            return;
+        }
+        if let Err(e) = window::present_dc(hwnd, shapes.dc(), r.x, r.y, r.w, r.h, alpha) {
+            log_line(&format!("shape present err {e:?}"));
+        }
+    }
+
+    /// 形变帧缓冲区尺寸：要装得下弹簧过冲（实测 +7%）与两种形态的较大者。
+    fn shape_buffer(&self) -> (i32, i32) {
+        morph::shape_buffer(self.scale)
+    }
+
+    /// 几何线程回报一帧矩形。形变中：**按当前矩形重画纯形状**再 ULW；
+    /// 非形变（hover 放大、躲让、呼吸）：沿用当前画布按 psize 裁切呈现。
+    fn on_geometry(&mut self, r: anim::Rect) {
+        if let Some(m) = &mut self.morph {
+            m.cur = r;
+            // 退场窗口内还没进入纯形状阶段：旧内容仍在淡出，别让形状帧盖上去。
+            // 进场阶段由正文接管，几何线程的帧一律忽略（避免形状帧盖住文字）。
+            if m.enter_at.is_some() {
+                return;
+            }
+            let t = m.t0.elapsed().as_secs_f64() * 1000.0;
+            if t < morph::retreat_ms(m.target) {
+                return;
+            }
+            self.paint_shape_frame(r);
+            if let Ok(mut g) = PRESENTED.lock() {
+                *g = r;
+            }
+            return;
+        }
+        // 岛态 hover 放大 / 躲让：画布尺寸可能和目标不同，先按目标重建。
+        if self.ui.w != r.w || self.ui.h != r.h {
+            if let Some(t) = self.layout.target(self.current_mode()) {
+                self.ensure_ui(t);
+                self.repaint();
+            }
+        }
+        self.present_rect(r);
     }
 
     /// 目标尺寸变了就重建画布（形态切换才发生，不是每帧）。
@@ -280,11 +455,16 @@ impl App {
 
     fn apply_mode(&mut self, m: mode::UiMode) {
         let code = mode::mode_code(m);
+        // 形变途中目标没变：不重开动画（形态线程 260 ms 一拍会重复报同一形态）。
+        if let Some(morph) = &self.morph {
+            if morph.target == m {
+                MODE.store(code, Ordering::Relaxed);
+                return;
+            }
+        }
         if self.applied == code && self.visible {
             return;
         }
-        self.applied = code;
-        MODE.store(code, Ordering::Relaxed);
         // 形态切换时 hover 时间轴归零：展开态的详情动画不能带进胶囊/隐藏态，
         // 反向切换也从头开始（鼠标若仍压着，下一次 WM_MOUSEMOVE 会重新触发）。
         self.hover = false;
@@ -300,6 +480,9 @@ impl App {
         }
 
         if m == mode::UiMode::Hidden {
+            self.applied = code;
+            MODE.store(code, Ordering::Relaxed);
+            self.stop_morph();
             self.breathe_on = false;
             if self.timer_on {
                 unsafe {
@@ -308,11 +491,12 @@ impl App {
                 self.timer_on = false;
             }
             if self.visible {
-                unsafe {
-                    let _ = ShowWindow(self.hwnd, SW_HIDE);
-                }
-                self.visible = false;
-                VISIBLE_FLAG.store(0, Ordering::Relaxed);
+                // `.card.out` 220 ms 淡出画完再隐藏（对照 fade_out）。
+                self.fade = Some(Fade {
+                    t0: Instant::now(),
+                    out: true,
+                });
+                self.sync_fade_timer();
             }
             return;
         }
@@ -320,10 +504,17 @@ impl App {
         let Some(target) = self.layout.target(m) else {
             return;
         };
-        self.ensure_ui(target);
-        self.repaint();
-        if !self.visible {
-            // 首次显示 / 从隐藏态回来：先把矩形摆正再露出来，避免空板。
+        let was_hidden = !self.visible;
+        // MODE 立刻更新（形态线程据此判"已应用"，不再重复派发）；
+        // `applied` 留到收尾才切——形变中间帧要按**旧形态**的内容淡出。
+        MODE.store(code, Ordering::Relaxed);
+
+        if was_hidden {
+            self.applied = code;
+            // 首次显示 / 从隐藏态回来：先把目标尺寸的内容画好再露出来，避免空板。
+            self.stop_morph();
+            self.ensure_ui(target);
+            self.repaint();
             self.present_rect(target);
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNA);
@@ -331,18 +522,256 @@ impl App {
             self.visible = true;
             VISIBLE_FLAG.store(1, Ordering::Relaxed);
             anim::snap_to(target);
-        } else {
-            // 内容重画完 → 窗口矩形弹簧形变（逐帧 ULW 改尺寸）。
-            anim::animate_to(target, mode::motion_for(m));
+            // 显示走 220 ms 淡入（`enter()` 的语义：内容已就绪，只淡不闪）
+            self.fade = Some(Fade {
+                t0: Instant::now(),
+                out: false,
+            });
+            self.sync_fade_timer();
+            self.sync_timer();
+            return;
         }
+
+        let from = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+        if from.w == target.w && from.h == target.h && from.x == target.x && from.y == target.y {
+            self.applied = code;
+            self.stop_morph();
+            self.ensure_ui(target);
+            self.repaint();
+            self.present_rect(target);
+            self.sync_timer();
+            return;
+        }
+
+        // 形变：内容退场 → 形状弹簧逐帧重绘 → 内容进场（morph.rs 的时间轴）。
+        self.fade = None;
+        self.sync_fade_timer();
+        // 起点帧：旧形态内容 + 旧矩形（接下来 120 ms 内淡出，只剩形状）。
+        if self.ui.w != from.w || self.ui.h != from.h {
+            self.ensure_ui(from);
+        }
+        self.morph = Some(Morph {
+            from,
+            to: target,
+            target: m,
+            t0: Instant::now(),
+            cur: from,
+            enter_at: None,
+        });
+        self.morph_alpha_step = 16;
+        self.repaint();
+        self.present_rect(from);
+        anim::animate_to(target, mode::motion_for(m));
+        self.sync_morph_timer();
         self.sync_timer();
+    }
+
+    /// 形变收尾：目标尺寸的内容整帧画好再呈现。
+    fn finish_morph(&mut self) {
+        let Some(m) = self.morph.take() else {
+            return;
+        };
+        self.applied = mode::mode_code(m.target);
+        MODE.store(self.applied, Ordering::Relaxed);
+        self.ensure_ui(m.to);
+        self.repaint();
+        self.present_rect(m.to);
+        self.sync_morph_timer();
+        self.sync_timer();
+    }
+
+    fn stop_morph(&mut self) {
+        self.morph = None;
+        self.shapes = None;
+        self.sync_morph_timer();
+    }
+
+    /// 16 ms 形变定时器：只在形变进行中运行（阶段推进、进场判据、看门狗）。
+    fn sync_morph_timer(&mut self) {
+        let need = self.morph.is_some() && self.visible;
+        if need && !self.morph_timer_on {
+            unsafe {
+                let _ = SetTimer(Some(self.hwnd), TIMER_MORPH, 16, None);
+            }
+            self.morph_timer_on = true;
+        } else if !need && self.morph_timer_on {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_MORPH);
+            }
+            self.morph_timer_on = false;
+        }
+    }
+
+    /// 形变三阶段推进：
+    /// 1. **退场**（0 → 弹簧 delay）：旧形态内容淡出，窗口还停在起点矩形；
+    /// 2. **纯形状**（delay → 几何落定）：几何线程每帧重画形状，一帧文字都没有；
+    /// 3. **进场**：几何落定后按目标尺寸画正文，260 ms 淡入。
+    ///
+    /// 进场不等 `enter_delay`（250/360 ms）而等几何落定，是因为原生没有 WebView
+    /// 在中间尺寸里重排文字的能力——差几个像素画上去就是被拉伸的字。落定时刻
+    /// 实测：展开 ≈500 ms、收回 ≈400 ms，与前端 360/250 ms 的观感同量级。
+    fn on_morph_timer(&mut self) {
+        let Some(m) = &self.morph else {
+            self.sync_morph_timer();
+            return;
+        };
+        let t = m.t0.elapsed().as_secs_f64() * 1000.0;
+        let (cur, target, to, enter_at) = (m.cur, m.target, m.to, m.enter_at);
+
+        // 阶段 3：内容已在淡入，只等它走完（此阶段不再看几何/看门狗）。
+        if let Some(at) = enter_at {
+            if t - at >= morph::CONTENT_IN_MS {
+                self.finish_morph();
+                return;
+            }
+            let alpha = self.content_alpha();
+            let step = (alpha * 16.0).round() as u8;
+            if step != self.morph_alpha_step {
+                self.morph_alpha_step = step;
+                self.repaint();
+                self.present_rect(to);
+            }
+            return;
+        }
+
+        // 保险丝：弹簧异常（几何线程没回报）也必须收尾，且只触发一次。
+        if t >= MORPH_TIMEOUT_MS as f64 {
+            log_line(&format!(
+                "morph watchdog: t={t:.0} err={:.3}",
+                morph::size_error(cur, to)
+            ));
+            self.begin_content_enter(t);
+            return;
+        }
+
+        // 阶段 1：退场（旧内容淡出，窗口仍停在起点矩形）。
+        if t < morph::retreat_ms(target) {
+            let alpha = self.content_alpha();
+            let step = (alpha * 16.0).round() as u8;
+            if step != self.morph_alpha_step {
+                self.morph_alpha_step = step;
+                self.repaint();
+                self.present_rect(cur);
+            }
+            return;
+        }
+
+        // 阶段 2：纯形状。几何线程逐帧重画；等到尺寸误差 ≤1.5% 才允许文字进场。
+        if !morph::content_ready(t, target, cur, to) {
+            return;
+        }
+        // 残余 ≤1.5%：吸附掉，之后几何线程不再发帧。
+        anim::snap_to(to);
+        self.begin_content_enter(t);
+    }
+
+    /// 切到目标形态、按目标尺寸整帧画好（文字从此第一次出现），进入淡入阶段。
+    fn begin_content_enter(&mut self, t_ms: f64) {
+        let Some(m) = &self.morph else {
+            return;
+        };
+        let to = m.to;
+        let target = m.target;
+        anim::snap_to(to);
+        self.applied = mode::mode_code(target);
+        MODE.store(self.applied, Ordering::Relaxed);
+        self.ensure_ui(to);
+        if let Some(m) = &mut self.morph {
+            m.cur = to;
+            m.enter_at = Some(t_ms);
+        }
+        self.morph_alpha_step = 0;
+        self.repaint();
+        self.present_rect(to);
+    }
+
+    /// 左键单击（未拖动）：双击 = 卡片收回胶囊；胶囊单击 = 展开 8 秒。
+    ///
+    /// 对照前端：`dblclick` → `collapse_to_island`、`.mini` click →
+    /// `expand_temporarily`。窗口没有 CS_DBLCLKS，双击由 `input` 自己数。
+    fn on_click(&mut self) {
+        let c = window::cursor_pos();
+        let now = input::Click {
+            at_ms: self.click_t0.elapsed().as_millis() as u64,
+            x: c.x,
+            y: c.y,
+        };
+        let dbl = input::is_double_click(self.last_click, now);
+        self.last_click = if dbl { None } else { Some(now) };
+        match self.effective_mode() {
+            mode::UiMode::Expanded if dbl => {
+                // 双击卡片：手动收回顶部胶囊，并压住桌面 2 s settle
+                MANUAL_ISLAND.store(1, Ordering::Relaxed);
+                if let Ok(mut g) = PIN_UNTIL.lock() {
+                    *g = None;
+                }
+                self.layout.home = {
+                    let cur = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+                    (cur.x, cur.y)
+                };
+                MODE.store(mode::mode_code(mode::UiMode::Island), Ordering::Relaxed);
+                self.apply_mode(mode::UiMode::Island);
+            }
+            mode::UiMode::Island if !dbl => {
+                // 单击胶囊：立即展开并 pin 8 秒（前台窗口切走即失效）
+                MANUAL_ISLAND.store(0, Ordering::Relaxed);
+                if let Ok(mut g) = PIN_UNTIL.lock() {
+                    *g = Some(Instant::now() + Duration::from_secs(mode::PIN_SECS));
+                }
+                let fg = unsafe { GetForegroundWindow() };
+                PIN_FG.store(fg.0 as isize, Ordering::Relaxed);
+                MODE.store(mode::mode_code(mode::UiMode::Expanded), Ordering::Relaxed);
+                self.apply_mode(mode::UiMode::Expanded);
+            }
+            _ => {}
+        }
+    }
+
+    /// 220 ms 淡出/淡入定时器：只在 fade 进行中运行。
+    fn sync_fade_timer(&mut self) {
+        let need = self.fade.is_some() && self.visible;
+        if need && !self.fade_timer_on {
+            unsafe {
+                let _ = SetTimer(Some(self.hwnd), TIMER_FADE, 16, None);
+            }
+            self.fade_timer_on = true;
+        } else if !need && self.fade_timer_on {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_FADE);
+            }
+            self.fade_timer_on = false;
+        }
+    }
+
+    fn on_fade_timer(&mut self) {
+        let Some(f) = &self.fade else {
+            self.sync_fade_timer();
+            return;
+        };
+        let done = f.t0.elapsed().as_secs_f64() * 1000.0 >= morph::FADE_MS;
+        let out = f.out;
+        let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+        self.present_rect(r);
+        if !done {
+            return;
+        }
+        self.fade = None;
+        self.sync_fade_timer();
+        if out {
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            }
+            self.visible = false;
+            VISIBLE_FLAG.store(0, Ordering::Relaxed);
+        }
     }
 
     /// 岛态呼吸/颜色过渡的 66 ms 定时器开关（D1：15 fps，DC/隐藏/展开暂停）。
     fn sync_timer(&mut self) {
         let island = self.current_mode() == mode::UiMode::Island && self.visible;
-        // 形变在 T3 尚未实现（T5），morph 固定 false；展开/隐藏/电池由 should_breathe 判。
-        self.breathe_on = island::should_breathe(island, self.battery, !self.visible, false);
+        // 形变期间呼吸暂停（`.morphing` 里点也一起退场，对照 updateBreathe 的 morphNow）。
+        let morphing = self.morph.is_some();
+        self.breathe_on = island::should_breathe(island, self.battery, !self.visible, morphing);
         let need = island && (self.breathe_on || !self.tint.settled());
         if need && !self.timer_on {
             unsafe {
@@ -363,7 +792,8 @@ impl App {
         let dt = (now - self.last_tick).as_secs_f64().clamp(0.0, 0.2);
         self.last_tick = now;
         self.tint.step(dt);
-        if self.current_mode() != mode::UiMode::Island || !self.visible {
+        // 形变期间呼吸暂停，也不许 repaint（纯形状帧由 morph 独占）。
+        if self.current_mode() != mode::UiMode::Island || !self.visible || self.morph.is_some() {
             return;
         }
         self.repaint();
@@ -381,16 +811,24 @@ impl App {
         }
         self.layout.hot = hot;
         HOT.store(hot as u8, Ordering::Relaxed);
-        if !self.visible || self.current_mode() != mode::UiMode::Island {
+        if !self.visible || self.effective_mode() != mode::UiMode::Island {
             return;
         }
-        if let Some(target) = self.layout.target(mode::UiMode::Island) {
-            self.ensure_ui(target);
-            self.repaint();
-            let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
-            self.present_rect(r);
+        let Some(target) = self.layout.target(mode::UiMode::Island) else {
+            return;
+        };
+        // 形变途中：只把落点改成新的胶囊尺寸，弹簧继续朝它跑（速度连续）。
+        // 不重开 morph 时间轴，也不动内容——中间帧仍然只有形状。
+        if let Some(m) = &mut self.morph {
+            m.to = target;
             anim::animate_to(target, mode::HOVER_MOTION);
+            return;
         }
+        self.ensure_ui(target);
+        self.repaint();
+        let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+        self.present_rect(r);
+        anim::animate_to(target, mode::HOVER_MOTION);
     }
 
     /// 展开态 hover：启动 cubic-bezier(.6,0,.25,1) 时间轴；岛态仍走弹簧放大。
@@ -399,11 +837,11 @@ impl App {
             return;
         }
         self.hover = on;
-        if self.current_mode() == mode::UiMode::Island {
+        if self.effective_mode() == mode::UiMode::Island {
             self.set_hot(on);
             return;
         }
-        if self.current_mode() != mode::UiMode::Expanded || !self.visible {
+        if self.effective_mode() != mode::UiMode::Expanded || !self.visible {
             return;
         }
         let now = self.hover_t0.elapsed().as_secs_f64() * 1000.0;
@@ -437,7 +875,7 @@ impl App {
         if self.hover_anim.done(now) {
             self.hover_anim.finish();
         }
-        if self.visible {
+        if self.visible && self.morph.is_none() {
             self.repaint();
             let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
             self.present_rect(r);
@@ -485,6 +923,11 @@ impl App {
 
         // 隐藏时不重绘/不 present：卡片内容看不见，1 Hz 全量重绘纯属浪费。
         if !self.visible {
+            return;
+        }
+        // 形变期间由 morph 时间轴独占呈现：这里只更新数据（采样已写进 hist /
+        // 弹簧目标），绝不能 repaint —— 否则旧形态画布会盖掉纯形状帧。
+        if self.morph.is_some() {
             return;
         }
         let mut need = false;
@@ -566,12 +1009,64 @@ impl App {
                 self.wifi_ok = false;
             }
         }
-        self.down = fmt_hysteresis(s.total_down, &mut self.unit_mb);
-        self.up = card::format_rate(s.total_up);
         self.hist.rotate_left(1);
         self.hist[HIST - 1] = s.total_down;
         self.up_hist.rotate_left(1);
         self.up_hist[HIST - 1] = s.total_up;
+        // 数字弹簧（P3-7）：胶囊态直接改文字，展开态 1% 阈值起摆。
+        self.rate_down = s.total_down;
+        self.rate_up = s.total_up;
+        let now = self.num_t0.elapsed().as_secs_f64() * 1000.0;
+        let island = self.current_mode() == mode::UiMode::Island;
+        if self.numbers.on_sample(s.total_down, s.total_up, island, now) {
+            self.sync_num_timer();
+        } else if !self.numbers.running() {
+            self.apply_number_values();
+        }
+    }
+
+    /// 把弹簧当前值写进显示字符串（`Math.max(0, x)` 已在 values() 里钳过）。
+    fn apply_number_values(&mut self) {
+        let (d, u) = self.numbers.values();
+        self.down = fmt_hysteresis(d, &mut self.unit_mb);
+        self.up = card::format_rate(u);
+    }
+
+    /// 16 ms 数字定时器：只在弹簧跑动时运行（30 fps 渲染闸在 number.rs）。
+    fn sync_num_timer(&mut self) {
+        let need = self.numbers.running() && self.visible;
+        if need && !self.number_timer_on {
+            self.num_last = Instant::now();
+            unsafe {
+                let _ = SetTimer(Some(self.hwnd), TIMER_NUM, 16, None);
+            }
+            self.number_timer_on = true;
+        } else if !need && self.number_timer_on {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_NUM);
+            }
+            self.number_timer_on = false;
+        }
+    }
+
+    fn on_num_timer(&mut self) {
+        let now_instant = Instant::now();
+        let dt = (now_instant - self.num_last).as_secs_f64().clamp(0.0, number::MAX_DT);
+        self.num_last = now_instant;
+        let now = self.num_t0.elapsed().as_secs_f64() * 1000.0;
+        let tick = self.numbers.tick(now, dt);
+        if tick.render {
+            self.apply_number_values();
+            if self.visible && self.morph.is_none() {
+                self.repaint();
+                let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+                self.present_rect(r);
+            }
+        }
+        if tick.finished {
+            self.apply_number_values();
+            self.sync_num_timer();
+        }
     }
 }
 
@@ -630,7 +1125,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if let Some(r) = r {
                 APP.with(|a| {
                     if let Some(app) = a.borrow_mut().as_mut() {
-                        app.present_rect(r);
+                        app.on_geometry(r);
                     }
                 });
             }
@@ -649,6 +1144,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         app.on_hover_timer();
                     }
                 });
+            } else if wp.0 == TIMER_NUM {
+                APP.with(|a| {
+                    if let Some(app) = a.borrow_mut().as_mut() {
+                        app.on_num_timer();
+                    }
+                });
+            } else if wp.0 == TIMER_FADE {
+                APP.with(|a| {
+                    if let Some(app) = a.borrow_mut().as_mut() {
+                        app.on_fade_timer();
+                    }
+                });
+            } else if wp.0 == TIMER_MORPH {
+                APP.with(|a| {
+                    if let Some(app) = a.borrow_mut().as_mut() {
+                        app.on_morph_timer();
+                    }
+                });
             }
             LRESULT(0)
         }
@@ -657,6 +1170,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if let Some(app) = a.borrow_mut().as_mut() {
                     if let Some((start, wx, wy)) = app.drag {
                         let c = window::cursor_pos();
+                        // 自绘拖动：按下即跟随（不用 HTCAPTION，双击不会最大化）
+                        if input::is_drag((start.x, start.y), (c.x, c.y)) {
+                            app.press_moved = true;
+                        }
                         let r = anim::Rect::new(wx + (c.x - start.x), wy + (c.y - start.y), app.ui.w, app.ui.h);
                         app.present_rect(r);
                     } else if !app.hover {
@@ -689,6 +1206,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let c = window::cursor_pos();
                     let cur = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
                     app.drag = Some((c, cur.x, cur.y));
+                    app.press = Some((c, cur.x, cur.y));
+                    app.press_moved = false;
                     SetCapture(hwnd);
                     if app.current_mode() == mode::UiMode::Island && !app.active {
                         app.active = true;
@@ -710,10 +1229,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         let r = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
                         app.present_rect(r);
                     }
-                    // 拖动落点成为新的桌面锚点（展开态才有意义）
-                    if app.current_mode() == mode::UiMode::Expanded {
+                    // 拖动落点成为新的桌面锚点（展开态才有意义）；
+                    // 没动过就还是点击，别把"点一下"记成新位置。
+                    if app.press_moved && app.current_mode() == mode::UiMode::Expanded {
                         let cur = *PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
                         app.layout.home = (cur.x, cur.y);
+                    }
+                    if !app.press_moved {
+                        app.on_click();
                     }
                 }
             });
@@ -872,6 +1395,132 @@ fn parse_dot_override(args: &[String]) -> Option<island::DotColor> {
     None
 }
 
+/// `--morph-frame MS`：定格形变中间帧（诊断/取证）。
+fn parse_morph_frame(args: &[String]) -> Option<f64> {
+    let mut i = 0;
+    while i < args.len() {
+        let v = args[i]
+            .strip_prefix("--morph-frame=")
+            .map(|s| s.to_string())
+            .or_else(|| {
+                if args[i] == "--morph-frame" && i + 1 < args.len() {
+                    Some(args[i + 1].clone())
+                } else {
+                    None
+                }
+            });
+        if let Some(v) = v {
+            return v.trim().parse().ok();
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_flag_value(args: &[String], flag: &str) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(v) = args[i].strip_prefix(&format!("{flag}=")) {
+            return Some(v.to_string());
+        }
+        if args[i] == flag && i + 1 < args.len() {
+            return Some(args[i + 1].clone());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 把弹簧在 `ms` 时刻的矩形算出来，用**真实形变路径**（ShapePainter）画一帧
+/// 然后停住。取证截图与运行时同源，不是另写一套近似。
+fn morph_frame(ms: f64, args: &[String]) -> Result<()> {
+    let scale = window::dpi_scale();
+    let screen = screen_rect();
+    let home = match window::parse_points(args, "--pos").first() {
+        Some(p) => *p,
+        None => mode::default_home(screen, scale),
+    };
+    let layout = mode::Layout {
+        scale,
+        screen,
+        home,
+        hot: false,
+        anchor: mode::IslandAnchor::Center,
+        island_pos: window::parse_points(args, "--island-pos").first().copied(),
+    };
+    let island = layout.target(mode::UiMode::Island).unwrap();
+    let card = layout.target(mode::UiMode::Expanded).unwrap();
+    let dir = parse_flag_value(args, "--morph-dir").unwrap_or_else(|| "expand".to_string());
+    let (from, to, target, from_mode) = if dir == "collapse" {
+        (card, island, mode::UiMode::Island, mode::UiMode::Expanded)
+    } else {
+        (island, card, mode::UiMode::Expanded, mode::UiMode::Island)
+    };
+    let motion = mode::motion_for(target);
+    let r = anim::rect_at(from, to, motion, ms);
+    let radius = morph::morph_frame_radius(r, from.w, to.w, scale);
+
+    let cfg = window::WindowConfig {
+        x: r.x,
+        y: r.y,
+        w: r.w,
+        h: r.h,
+        visible: true,
+    };
+    let hwnd = window::create_window(&cfg, Some(bench_proc))?;
+    // 退场窗口内窗口仍停在起点矩形、内容是旧形态淡出 → 用真实渲染器画旧形态内容；
+    // delay 走完才是纯形状帧。两条路径与运行时逐字对应，截图不是另一套近似。
+    let retreat = morph::retreat_ms(target);
+    let (pr, content) = if ms < retreat {
+        let alpha = morph::fade_out_alpha(ms, target);
+        (from, format!("content-fade alpha={alpha:.2}"))
+    } else {
+        (r, "shape-only".to_string())
+    };
+    if ms < retreat {
+        let surf = window::Surface::new(None, pr.w, pr.h)?;
+        let renderer = render::Renderer::new(surf.mem_dc, pr.w, pr.h, scale)?;
+        let mut f = demo_frame(vec![0.0; HIST]);
+        f.content_alpha = morph::fade_out_alpha(ms, target);
+        if from_mode == mode::UiMode::Island {
+            f.title.clear();
+            f.state.clear();
+            f.wifi.clear();
+            f.proxy.clear();
+            renderer.paint_island(&f)?;
+        } else {
+            renderer.paint(&f)?;
+        }
+        window::present_dc(hwnd, surf.mem_dc, pr.x, pr.y, pr.w, pr.h, 255)?;
+    } else {
+        let painter = render::ShapePainter::new(pr.w, pr.h, scale)?;
+        painter.paint(pr.w, pr.h, radius)?;
+        window::present_dc(hwnd, painter.dc(), pr.x, pr.y, pr.w, pr.h, 255)?;
+    }
+    println!(
+        "morph-frame dir={dir} t={ms:.0}ms rect=({}, {}, {}, {}) radius={radius:.1} {content}",
+        pr.x, pr.y, pr.w, pr.h
+    );
+    // 停住供截图：默认一直显示（右键退出，与主窗口一致）；
+    // `--exit-after MS` 到时自动销毁，截图脚本不必杀进程。
+    let hold = parse_flag_value(args, "--exit-after").and_then(|v| v.parse::<u64>().ok());
+    if let Some(hold) = hold {
+        std::thread::sleep(Duration::from_millis(hold));
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        return Ok(());
+    }
+    let mut msg = MSG::default();
+    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    Ok(())
+}
+
 fn run(args: &[String]) -> Result<()> {
     let scale = window::dpi_scale();
     let screen = screen_rect();
@@ -900,7 +1549,9 @@ fn run(args: &[String]) -> Result<()> {
     };
     let card = layout.card();
 
-    let start_visible = !silent && mode_override != Some(ModeOverride::Hidden);
+    let show_after = parse_flag_value(args, "--show-after").is_some();
+    let start_visible =
+        !silent && mode_override != Some(ModeOverride::Hidden) && !show_after;
     // 静默启动从胶囊态起步：gate 必须先走满 2 s 桌面 settle 才会给出 Expanded，
     // 在此之前 show_on_decide 一律不显窗（P1-3）。非静默直接以展开态冷启动。
     let initial_mode = match mode_override {
@@ -922,6 +1573,15 @@ fn run(args: &[String]) -> Result<()> {
     let hwnd = window::create_window(&cfg, Some(wndproc))?;
     let ui = Ui::new(Some(hwnd), initial_rect.w, initial_rect.h, scale)?;
     let raw = hwnd.0 as isize;
+
+    // 诊断/截图用：`--exit-after MS` 到点自动退出（不 kill 进程）。
+    if let Some(ms) = parse_flag_value(args, "--exit-after").and_then(|v| v.parse::<u64>().ok()) {
+        let raw = raw;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(ms));
+            window::post(raw, WM_CLOSE);
+        });
+    }
     if let Ok(mut g) = PRESENTED.lock() {
         *g = initial_rect;
     }
@@ -1062,6 +1722,22 @@ fn run(args: &[String]) -> Result<()> {
         hover_anim: fx::HoverAnim::new(),
         hover_timer_on: false,
         hover_t0: Instant::now(),
+        numbers: number::NumberAnim::new(),
+        number_timer_on: false,
+        num_t0: Instant::now(),
+        num_last: Instant::now(),
+        rate_down: 0.0,
+        rate_up: 0.0,
+        morph: None,
+        morph_timer_on: false,
+        morph_alpha_step: u8::MAX,
+        shapes: None,
+        fade: None,
+        fade_timer_on: false,
+        last_click: None,
+        click_t0: Instant::now(),
+        press: None,
+        press_moved: false,
     };
     app.repaint();
     app.present_rect(initial_rect);
@@ -1084,8 +1760,37 @@ fn run(args: &[String]) -> Result<()> {
         initial_rect,
     );
 
+    // 诊断：`--show-after MS` 起手隐藏，到点后走真实 apply_mode 显示初始形态
+    // （验证"隐藏 -> 恢复首帧无空板"）。不改变默认路径。
+    if let Some(ms) = parse_flag_value(args, "--show-after").and_then(|v| v.parse::<u64>().ok()) {
+        let raw = raw;
+        let m = initial_mode;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(ms));
+            MODE.store(mode::mode_code(m), Ordering::Relaxed);
+            window::post(raw, window::WM_APP_MODE);
+        });
+    }
+
+    // 诊断：`--morph-demo` 走真实 apply_mode 路径交替两态（截图/几何采样用），
+    // 不接形态线程也不改默认行为。
+    if args.iter().any(|a| a == "--morph-demo") {
+        let raw = raw;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(900));
+            let mut island = true;
+            loop {
+                std::thread::sleep(Duration::from_millis(2400));
+                island = !island;
+                let m = if island { mode::UiMode::Island } else { mode::UiMode::Expanded };
+                MODE.store(mode::mode_code(m), Ordering::Relaxed);
+                window::post(raw, window::WM_APP_MODE);
+            }
+        });
+    }
+
     // 形态线程：260 ms 前台轮询 → ModeGate → 三态（spec D3 维持 260 ms）。
-    {
+    if !args.iter().any(|a| a == "--morph-demo") {
         let raw = raw;
         let mut layout = layout;
         std::thread::spawn(move || {
@@ -1153,14 +1858,24 @@ fn run(args: &[String]) -> Result<()> {
                     }
                 }
 
+                let now = Instant::now();
+                // 手动展开的 8 秒 pin：pin 期内保持展开，前台切到别的应用即失效。
+                let pin = *PIN_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+                let pinned = mode::pinned_here(
+                    pin,
+                    now,
+                    PIN_FG.load(Ordering::Relaxed),
+                    fg.0 as isize,
+                    kind,
+                );
                 let mut want = gate.decide(
-                    Instant::now(),
+                    now,
                     mode::FgSnapshot {
                         kind,
                         fullscreen: kind == mode::FgKind::App && fg_is_fullscreen(fg),
-                        // 点击/双击/躲让的交互接线在 T5；这里只跑状态机本身。
-                        manual_island: false,
-                        pinned_here: false,
+                        // 双击收回后压过桌面 2 s settle（对照 MANUAL_ISLAND）。
+                        manual_island: MANUAL_ISLAND.load(Ordering::Relaxed) != 0,
+                        pinned_here: pinned,
                         already_expanded: current == mode::UiMode::Expanded,
                     },
                 );
@@ -1258,6 +1973,7 @@ fn demo_frame(hist: Vec<f64>) -> render::Frame {
         hover_fx: fx::HoverFx::IDLE,
         active: false,
         dot: render::DotPaint::default(),
+        content_alpha: 1.0,
     }
 }
 
@@ -1371,6 +2087,57 @@ fn bench() -> Result<()> {
     println!(
         "island paint+present: {:.3} ms/frame (300 frames)",
         t0.elapsed().as_secs_f64() * 1000.0 / 300.0
+    );
+    // 形变中间帧（纯形状）成本：每帧按当前矩形重画圆角矩形 + ULW。
+    // spec §6 基线表里的「纯形状」项就是它。
+    let (bw, bh) = morph::shape_buffer(scale);
+    let shape = render::ShapePainter::new(bw, bh, scale)?;
+    let from = mode::Layout {
+        scale,
+        screen: screen_rect(),
+        home: (0, 0),
+        hot: false,
+        anchor: mode::IslandAnchor::Center,
+        island_pos: None,
+    };
+    let island_r = from.target(mode::UiMode::Island).unwrap();
+    let card_r = from.target(mode::UiMode::Expanded).unwrap();
+    let motion = mode::motion_for(mode::UiMode::Expanded);
+    let n = 120;
+    let frames: Vec<anim::Rect> = (0..n)
+        .map(|i| anim::rect_at(island_r, card_r, motion, i as f64 * 6.0))
+        .collect();
+    let t0 = std::time::Instant::now();
+    for r in &frames {
+        let radius = morph::morph_frame_radius(*r, island_r.w, card_r.w, scale);
+        shape.paint(r.w, r.h, radius)?;
+    }
+    println!(
+        "morph shape paint: {:.3} ms/frame ({} frames, {}x{} buffer)",
+        t0.elapsed().as_secs_f64() * 1000.0 / n as f64,
+        n,
+        bw,
+        bh
+    );
+    let t0 = std::time::Instant::now();
+    for r in &frames {
+        window::present_dc(bench_hwnd, shape.dc(), r.x, r.y, r.w, r.h, 255)?;
+    }
+    println!(
+        "morph shape present: {:.3} ms/frame ({} frames)",
+        t0.elapsed().as_secs_f64() * 1000.0 / n as f64,
+        n
+    );
+    let t0 = std::time::Instant::now();
+    for r in &frames {
+        let radius = morph::morph_frame_radius(*r, island_r.w, card_r.w, scale);
+        shape.paint(r.w, r.h, radius)?;
+        window::present_dc(bench_hwnd, shape.dc(), r.x, r.y, r.w, r.h, 255)?;
+    }
+    println!(
+        "morph shape paint+present: {:.3} ms/frame ({} frames)",
+        t0.elapsed().as_secs_f64() * 1000.0 / n as f64,
+        n
     );
     let t0 = std::time::Instant::now();
     for _ in 0..50 {

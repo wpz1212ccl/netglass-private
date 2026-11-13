@@ -69,6 +69,9 @@ pub struct Frame {
     /// 岛态按下（`.card.collapsed:active`，玻璃压暗一档）。
     pub active: bool,
     pub dot: DotPaint,
+    /// 内容不透明度（形变进出场）：1 = 正常，0 = 只有形状（`.morphing`）。
+    /// 只作用于曲线与正文，玻璃形状始终满不透明。
+    pub content_alpha: f32,
 }
 
 fn c(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
@@ -1414,6 +1417,37 @@ impl Renderer {
         let mix = (fx.glass.clamp(0.0, 1.0) * 8.0).round() as usize;
         self.draw_card_bg(mix)?;
 
+        // 形变进出场：只淡内容（曲线 + 正文），形状不动——对照 CSS 里
+        // `.morphing .inner/.chart { opacity: 0 }`，形状本身保持满不透明。
+        let content_alpha = f.content_alpha.clamp(0.0, 1.0);
+        if content_alpha <= 0.002 {
+            unsafe {
+                self.rt.EndDraw(None, None)?;
+            }
+            return Ok(());
+        }
+        let layer = if content_alpha < 0.998 {
+            let layer = unsafe { self.rt.CreateLayer(None)? };
+            let params = D2D1_LAYER_PARAMETERS {
+                contentBounds: D2D_RECT_F {
+                    left: 0.0,
+                    top: 0.0,
+                    right: w,
+                    bottom: self.h,
+                },
+                geometricMask: std::mem::ManuallyDrop::new(None),
+                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                maskTransform: Matrix3x2::identity(),
+                opacity: content_alpha,
+                opacityBrush: std::mem::ManuallyDrop::new(None),
+                layerOptions: D2D1_LAYER_OPTIONS_NONE,
+            };
+            unsafe { self.rt.PushLayer(&params, &layer) };
+            Some(layer)
+        } else {
+            None
+        };
+
         // 2. 曲线（在 .inner 下面）。
         self.draw_chart(f)?;
 
@@ -1620,6 +1654,9 @@ impl Renderer {
         }
 
         unsafe {
+            if layer.is_some() {
+                self.rt.PopLayer();
+            }
             self.rt.EndDraw(None, None)?;
         }
         Ok(())
@@ -1631,15 +1668,20 @@ impl Renderer {
     /// 这样 15 fps 呼吸不再每帧触发 D2D 的 BeginDraw/EndDraw 与全表面渐变重绘。
     pub fn paint_island(&self, f: &Frame) -> Result<()> {
         let (static_dc, dot_cx) = self.ensure_island_static(f)?;
-        self.ensure_dot_tiles(&f.dot)?;
+        let show_dot = f.content_alpha > 0.002;
+        if show_dot {
+            self.ensure_dot_tiles(&f.dot)?;
+        }
         let (tile, strip_dc, phase) = {
             let cache = self.dot_tiles.borrow();
-            let t = cache.as_ref().unwrap();
-            (
-                t.tile,
-                t.surface.mem_dc,
-                f.dot.phase.min(island::BREATHE_PHASES - 1),
-            )
+            match cache.as_ref() {
+                Some(t) => (
+                    t.tile,
+                    Some(t.surface.mem_dc),
+                    f.dot.phase.min(island::BREATHE_PHASES - 1),
+                ),
+                None => (0, None, 0),
+            }
         };
         unsafe {
             let _ = BitBlt(
@@ -1653,6 +1695,13 @@ impl Renderer {
                 0,
                 SRCCOPY,
             );
+            // 形变中间帧只有形状：呼吸点也一起退场（`.morphing .mini` opacity 0）
+            if !show_dot {
+                return Ok(());
+            }
+            let (Some(strip_dc), true) = (strip_dc, tile > 0) else {
+                return Ok(());
+            };
             let left = (dot_cx - tile as f32 / 2.0).round() as i32;
             let top = (self.h / 2.0 - tile as f32 / 2.0).round() as i32;
             let blend = BLENDFUNCTION {
@@ -1679,9 +1728,11 @@ impl Renderer {
     }
 
     fn island_static_key(f: &Frame) -> String {
+        // 内容不透明度按 1/16 量化：形变进出场时静态层要跟着淡，但不能每帧重画。
+        let ca = (f.content_alpha.clamp(0.0, 1.0) * 16.0).round() as u8;
         format!(
-            "{}|{}|{}|{}|{}|{}",
-            f.down_value, f.down_unit, f.up_value, f.up_unit, f.hover, f.active
+            "{}|{}|{}|{}|{}|{}|{}",
+            f.down_value, f.down_unit, f.up_value, f.up_unit, f.hover, f.active, ca
         )
     }
 
@@ -1750,6 +1801,36 @@ impl Renderer {
                 self.rt.FillRoundedRectangle(&body, &pill.r2);
             }
 
+            // 形变进出场：迷你数字与发丝随 content_alpha 淡入淡出，形状不动。
+            let ca = f.content_alpha.clamp(0.0, 1.0);
+            if ca <= 0.002 {
+                unsafe {
+                    self.rt.EndDraw(None, None)?;
+                }
+                return Ok(w / 2.0);
+            }
+            let layer = if ca < 0.998 {
+                let layer = unsafe { self.rt.CreateLayer(None)? };
+                let params = D2D1_LAYER_PARAMETERS {
+                    contentBounds: D2D_RECT_F {
+                        left: 0.0,
+                        top: 0.0,
+                        right: w,
+                        bottom: h,
+                    },
+                    geometricMask: std::mem::ManuallyDrop::new(None),
+                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    maskTransform: Matrix3x2::identity(),
+                    opacity: ca,
+                    opacityBrush: std::mem::ManuallyDrop::new(None),
+                    layerOptions: D2D1_LAYER_OPTIONS_NONE,
+                };
+                unsafe { self.rt.PushLayer(&params, &layer) };
+                Some(layer)
+            } else {
+                None
+            };
+
             // 迷你一行：点 + 5px + 下行数字 + 单位 + 上行，整体水平居中。
             let gap = self.p(5.0);
             let up = format!("↑ {} {}", f.up_value, f.up_unit);
@@ -1807,6 +1888,9 @@ impl Renderer {
                     self.p(0.5),
                     None,
                 );
+                if layer.is_some() {
+                    self.rt.PopLayer();
+                }
                 self.rt.EndDraw(None, None)?;
             }
             Ok(dot_cx)
@@ -1963,5 +2047,139 @@ impl Renderer {
 
     pub fn dimensions(&self) -> (f32, f32) {
         (self.w, self.h)
+    }
+}
+
+/// 形变中间帧的绘制器（P3-6）：**只有形状、没有文字**（`.morphing` 语义）。
+///
+/// 每帧按当前矩形重新铺几何——ULW 的源图取 `psize` 区域是 1:1 裁切，
+/// 所以中间帧不会把整张卡片的位图缩放拉花。缓冲区一次分配到最大尺寸
+/// （卡片），每帧只重绑子矩形，避免逐帧 `CreateDIBSection`。
+pub struct ShapePainter {
+    rt: ID2D1DCRenderTarget,
+    surface: window::Surface,
+    grad: ID2D1LinearGradientBrush,
+    hair: ID2D1SolidColorBrush,
+    scale: f32,
+    _factory: ID2D1Factory,
+}
+
+impl ShapePainter {
+    pub fn new(w: i32, h: i32, scale: f32) -> Result<Self> {
+        let factory: ID2D1Factory =
+            unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
+        let props = D2D1_RENDER_TARGET_PROPERTIES {
+            r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            usage: D2D1_RENDER_TARGET_USAGE_NONE,
+            minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+        };
+        let rt = unsafe { factory.CreateDCRenderTarget(&props)? };
+        let surface = window::Surface::new(None, w, h)?;
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
+        unsafe { rt.BindDC(surface.mem_dc, &rect)? };
+        // `.card.morphing` 的底：linear-gradient(180deg,rgba(255,255,255,.34),
+        // rgba(246,248,252,.24))，加内发丝 inset 0 0 0 .5px rgba(255,255,255,.55)。
+        let stops = [
+            D2D1_GRADIENT_STOP {
+                position: 0.0,
+                color: c(255, 255, 255, 0.34),
+            },
+            D2D1_GRADIENT_STOP {
+                position: 1.0,
+                color: c(246, 248, 252, 0.24),
+            },
+        ];
+        let grad = Self::grad(
+            &rt,
+            &stops,
+            Vector2::new(0.0, 0.0),
+            Vector2::new(0.0, h as f32),
+        )?;
+        let hair = unsafe { rt.CreateSolidColorBrush(&c(255, 255, 255, 0.55), None)? };
+        Ok(Self {
+            rt,
+            surface,
+            grad,
+            hair,
+            scale,
+            _factory: factory,
+        })
+    }
+
+    fn grad(
+        rt: &ID2D1RenderTarget,
+        stops: &[D2D1_GRADIENT_STOP],
+        start: Vector2,
+        end: Vector2,
+    ) -> Result<ID2D1LinearGradientBrush> {
+        let collection = unsafe {
+            rt.CreateGradientStopCollection(stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?
+        };
+        let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+            startPoint: start,
+            endPoint: end,
+        };
+        unsafe { rt.CreateLinearGradientBrush(&props, None, &collection) }
+    }
+
+    /// 按当前矩形重画纯形状（圆角半径由 morph.rs 的插值给出）。
+    pub fn paint(&self, w: i32, h: i32, radius: f32) -> Result<()> {
+        let w = w.max(1);
+        let h = h.max(1);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
+        unsafe { self.rt.BindDC(self.surface.mem_dc, &rect)? };
+        let body = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: w as f32,
+                bottom: h as f32,
+            },
+            radiusX: radius.max(0.0),
+            radiusY: radius.max(0.0),
+        };
+        let inset = 0.25 * self.scale;
+        let rim = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: inset,
+                top: inset,
+                right: w as f32 - inset,
+                bottom: h as f32 - inset,
+            },
+            radiusX: (radius - inset).max(0.0),
+            radiusY: (radius - inset).max(0.0),
+        };
+        unsafe {
+            self.rt.BeginDraw();
+            self.rt.Clear(Some(&c(0, 0, 0, 0.0)));
+            self.rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            self.grad.SetStartPoint(Vector2::new(0.0, 0.0));
+            self.grad.SetEndPoint(Vector2::new(0.0, h as f32));
+            self.rt.FillRoundedRectangle(&body, &self.grad);
+            self.rt
+                .DrawRoundedRectangle(&rim, &self.hair, 0.5 * self.scale, None);
+            self.rt.EndDraw(None, None)?;
+        }
+        Ok(())
+    }
+
+    pub fn dc(&self) -> HDC {
+        self.surface.mem_dc
     }
 }

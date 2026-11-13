@@ -176,6 +176,30 @@ impl Geometry {
     }
 }
 
+/// 从 `from` 出发、按 `motion` 朝 `to` 跑 `ms` 毫秒后的矩形（含 delay 停顿）。
+///
+/// 与 `run()` 里的推进逐字一致（4 ms 子步），因此诊断用的 `--morph-frame`
+/// 能把任意时刻的中间帧定格，截图与真实动画同源、不是另一套近似。
+pub fn rect_at(from: Rect, to: Rect, motion: Motion, ms: f64) -> Rect {
+    let mut geom = Geometry::from_rect(from);
+    geom.retarget(to);
+    let mut t = 0.0f64;
+    let delay = motion.delay_ms as f64;
+    while t < delay && t < ms {
+        t += 4.0;
+    }
+    let mut remain = (ms - delay).max(0.0);
+    while remain > 0.0 {
+        let h = remain.min(4.0) / 1000.0;
+        geom.step(h, motion);
+        remain -= h * 1000.0;
+    }
+    if geom.settled() {
+        return to;
+    }
+    geom.rect()
+}
+
 fn run(target: Target, initial: Rect, rx: Receiver<Command>) {
     let mut geom = Geometry::from_rect(initial);
     let mut motion = Motion::new(0.36, 0.86);
