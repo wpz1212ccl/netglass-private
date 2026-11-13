@@ -12,7 +12,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -28,8 +29,16 @@ pub fn dpi_scale() -> f32 {
     unsafe { GetDpiForSystem() as f32 / 96.0 }
 }
 
+/// 窗口所在显示器的 DPI 缩放（PMv2 下跨屏会变；`WM_DPICHANGED` 之后用它复核）。
+pub fn dpi_scale_for(hwnd: HWND) -> f32 {
+    unsafe { GetDpiForWindow(hwnd) as f32 / 96.0 }
+}
+
 /// 屏幕 DC 缓存：ULW 每帧都要一个屏幕 DC，反复 GetDC/ReleaseDC 在 15 fps
 /// 呼吸路径上是可见开销。进程退出时由系统回收，不需要手动释放。
+///
+/// **跨 DPI 屏移动时必须作废**（T3 复核留的联动验证项）：缓存的 DC 绑定在
+/// 取它时的那块显示器上，`WM_DPICHANGED` 之后继续用旧 DC 会让 ULW 落位偏移。
 fn screen_dc() -> HDC {
     use std::cell::Cell;
     thread_local! {
@@ -43,6 +52,23 @@ fn screen_dc() -> HDC {
         let dc = unsafe { GetDC(None) };
         c.set(dc.0 as isize);
         dc
+    })
+}
+
+/// 丢掉缓存的屏幕 DC（`WM_DPICHANGED` 用）。下一次 `present_dc` 会重新取。
+pub fn reset_screen_dc() {
+    use std::cell::Cell;
+    thread_local! {
+        static CACHE: Cell<isize> = const { Cell::new(0) };
+    }
+    CACHE.with(|c| {
+        let v = c.get();
+        if v != 0 {
+            unsafe {
+                ReleaseDC(None, HDC(v as *mut c_void));
+            }
+            c.set(0);
+        }
     })
 }
 
@@ -311,6 +337,15 @@ pub const WM_APP_SAMPLE: u32 = 0x8000 + 1;
 pub const WM_APP_MODE: u32 = 0x8000 + 2;
 /// 几何线程 → UI 线程：形变中间帧（矩形从 `pending_geometry` 取）。
 pub const WM_APP_GEOMETRY: u32 = 0x8000 + 3;
+/// DPI 轮询线程 → UI 线程：窗口所在显示器 DPI 变了（wparam = 新 DPI）。
+///
+/// 为什么不能只靠 `WM_DPICHANGED`：本窗口的位置/尺寸由 `UpdateLayeredWindow`
+/// 的 pptDst/psize 决定，跨屏拖动不经过 `SetWindowPos`，系统不一定会发
+/// `WM_DPICHANGED`。轮询 `GetDpiForWindow` 是可靠兜底（2 s 一次，成本可忽略），
+/// 两条路径最终都进同一个 `App::on_dpi_changed`。
+pub const WM_APP_DPI: u32 = 0x8000 + 4;
+/// 托盘图标回调（wparam = 鼠标消息，lparam = 屏幕坐标）。
+pub const WM_APP_TRAY: u32 = 0x8000 + 5;
 
 pub fn post(raw: isize, msg: u32) {
     unsafe {
@@ -320,4 +355,16 @@ pub fn post(raw: isize, msg: u32) {
 
 pub fn post_sample(raw: isize) {
     post(raw, WM_APP_SAMPLE);
+}
+
+/// 投递 DPI 变化（wparam = 新 DPI，lparam = 0）。
+pub fn post_dpi(raw: isize, dpi: u32) {
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(raw as *mut c_void)),
+            WM_APP_DPI,
+            WPARAM(dpi as usize),
+            LPARAM(0),
+        );
+    }
 }
