@@ -1470,6 +1470,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(0)
         }
+        WM_CONTEXTMENU => {
+            // NOTIFYICON_VERSION_4 的右键**不走** uCallbackMessage：Explorer 直接
+            // 向托盘回调窗口发本消息（wp=图标句柄、lp=打包屏幕坐标）。V0-V3 才是
+            // 回调里塞 WM_RBUTTONUP。没有这条臂，真实托盘右键永远落在
+            // DefWindowProcW → 菜单永不弹出（用户实测"右键无反应"）。
+            // 注意输入源区分：来自托盘的 wp 是图标 HICON；键盘 Shift+F10 的
+            // wp = -1（无图标句柄）→ 忽略，避免在窗口原点弹菜单。
+            if wp.0 as isize == -1 || wp.0 == 0 {
+                return LRESULT(0);
+            }
+            let pt = tray::point_from_lparam(lp.0);
+            let items = APP.with(|a| a.borrow().as_ref().map(|app| app.menu_items()));
+            let Some(items) = items else {
+                return LRESULT(0);
+            };
+            let action = TRAY.with(|t| {
+                t.borrow()
+                    .as_ref()
+                    .and_then(|tray| tray.show_menu(&items, pt))
+            });
+            if let Some(action) = action {
+                APP.with(|a| {
+                    if let Some(app) = a.borrow_mut().as_mut() {
+                        app.on_menu_action(action);
+                    }
+                });
+            }
+            LRESULT(0)
+        }
         WM_HOTKEY => {
             APP.with(|a| {
                 if let Some(app) = a.borrow_mut().as_mut() {
