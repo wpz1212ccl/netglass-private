@@ -12,7 +12,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -26,6 +27,47 @@ pub fn dpi_aware() {
 
 pub fn dpi_scale() -> f32 {
     unsafe { GetDpiForSystem() as f32 / 96.0 }
+}
+
+/// 窗口所在显示器的 DPI 缩放（PMv2 下跨屏会变；`WM_DPICHANGED` 之后用它复核）。
+pub fn dpi_scale_for(hwnd: HWND) -> f32 {
+    unsafe { GetDpiForWindow(hwnd) as f32 / 96.0 }
+}
+
+/// 屏幕 DC 缓存：ULW 每帧都要一个屏幕 DC，反复 GetDC/ReleaseDC 在 15 fps
+/// 呼吸路径上是可见开销。进程退出时由系统回收，不需要手动释放。
+///
+/// **跨 DPI 屏移动时必须作废**（T3 复核留的联动验证项）：缓存的 DC 绑定在
+/// 取它时的那块显示器上，`WM_DPICHANGED` 之后继续用旧 DC 会让 ULW 落位偏移。
+/// 缓存与作废必须共用同一个 thread_local（T7 review 发现：曾各自内联一份，
+/// 导致 reset 清的是自己的空缓存，旧 DC 永不失效）。
+thread_local! {
+    static SCREEN_DC: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+fn screen_dc() -> HDC {
+    SCREEN_DC.with(|c| {
+        let v = c.get();
+        if v != 0 {
+            return HDC(v as *mut c_void);
+        }
+        let dc = unsafe { GetDC(None) };
+        c.set(dc.0 as isize);
+        dc
+    })
+}
+
+/// 丢掉缓存的屏幕 DC（`WM_DPICHANGED` 用）。下一次 `present_dc` 会重新取。
+pub fn reset_screen_dc() {
+    SCREEN_DC.with(|c| {
+        let v = c.get();
+        if v != 0 {
+            unsafe {
+                ReleaseDC(None, HDC(v as *mut c_void));
+            }
+            c.set(0);
+        }
+    })
 }
 
 /// A 32bpp premultiplied-ARGB DIB with its memory DC -- the surface that both
@@ -77,37 +119,25 @@ impl Surface {
     }
 
     pub fn present(&self, x: i32, y: i32) -> Result<()> {
-        let hwnd = match self.hwnd {
-            Some(h) => h,
-            None => return Ok(()),
-        };
-        unsafe {
-            let dst = POINT { x, y };
-            let size = SIZE {
-                cx: self.w,
-                cy: self.h,
-            };
-            let src = POINT { x: 0, y: 0 };
-            let blend = BLENDFUNCTION {
-                BlendOp: 0, // AC_SRC_OVER
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: 1, // AC_SRC_ALPHA
-            };
-            let screen = GetDC(None);
-            let r = UpdateLayeredWindow(
-                hwnd,
-                Some(screen),
-                Some(&dst),
-                Some(&size),
-                Some(self.mem_dc),
-                Some(&src),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
-            ReleaseDC(None, screen);
-            r
+        self.present_rect(x, y, self.w, self.h)
+    }
+
+    /// ULW 的 pptDst + psize 可以逐帧改位置与尺寸，形变因此不需要 SetWindowPos，
+    /// 也不会和窗口 resize 抢主线程（spec §2 D8）。
+    ///
+    /// 源图取 `pptSrc=(0,0)` 起的 psize 区域：DIB 比 psize 大时是 1:1 裁切、
+    /// **不缩放**，所以形变帧必须按当前矩形重画（T5 的 `render::ShapePainter`），
+    /// 不能拿整张卡片的位图去缩——那会把文字拉花。
+    pub fn present_rect(&self, x: i32, y: i32, w: i32, h: i32) -> Result<()> {
+        self.present_rect_alpha(x, y, w, h, 255)
+    }
+
+    /// 带全局不透明度的呈现：`.card.out` 的 220 ms 淡出/淡入用
+    /// `BLENDFUNCTION::SourceConstantAlpha` 实现，不必重画内容。
+    pub fn present_rect_alpha(&self, x: i32, y: i32, w: i32, h: i32, alpha: u8) -> Result<()> {
+        match self.hwnd {
+            Some(hwnd) => present_dc(hwnd, self.mem_dc, x, y, w, h, alpha),
+            None => Ok(()),
         }
     }
 
@@ -140,11 +170,44 @@ impl Drop for Surface {
     }
 }
 
+/// 把任意 32bpp premultiplied DIB 的 DC 贴到 layered window 上（形变帧共用）。
+pub fn present_dc(hwnd: HWND, src_dc: HDC, x: i32, y: i32, w: i32, h: i32, alpha: u8) -> Result<()> {
+    unsafe {
+        let dst = POINT { x, y };
+        let size = SIZE {
+            cx: w.max(1),
+            cy: h.max(1),
+        };
+        let src = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: 0, // AC_SRC_OVER
+            BlendFlags: 0,
+            SourceConstantAlpha: alpha,
+            AlphaFormat: 1, // AC_SRC_ALPHA
+        };
+        // 每帧 GetDC/ReleaseDC 是可见开销（15 fps 呼吸）；缓存屏幕 DC。
+        let screen = screen_dc();
+        UpdateLayeredWindow(
+            hwnd,
+            Some(screen),
+            Some(&dst),
+            Some(&size),
+            Some(src_dc),
+            Some(&src),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        )
+    }
+}
+
 pub struct WindowConfig {
     pub x: i32,
     pub y: i32,
     pub w: i32,
     pub h: i32,
+    /// false 时创建即隐藏（`--silent` 自启动不显窗）。
+    pub visible: bool,
 }
 
 pub fn create_window(cfg: &WindowConfig, proc: WNDPROC) -> Result<HWND> {
@@ -164,11 +227,16 @@ pub fn create_window(cfg: &WindowConfig, proc: WNDPROC) -> Result<HWND> {
             lpszClassName: PCWSTR(cls.as_ptr()),
         };
         let _ = RegisterClassW(&wc);
+        let style = if cfg.visible {
+            WS_POPUP | WS_VISIBLE
+        } else {
+            WS_POPUP
+        };
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
             PCWSTR(cls.as_ptr()),
             PCWSTR(wide("NetGlass Native").as_ptr()),
-            WS_POPUP | WS_VISIBLE,
+            style,
             cfg.x,
             cfg.y,
             cfg.w,
@@ -263,9 +331,38 @@ pub fn parse_points(args: &[String], flag: &str) -> Vec<(i32, i32)> {
 }
 
 pub const WM_APP_SAMPLE: u32 = 0x8000 + 1;
+/// 形态线程 → UI 线程：形态变了（wparam = mode_code）。
+pub const WM_APP_MODE: u32 = 0x8000 + 2;
+/// 几何线程 → UI 线程：形变中间帧（矩形从 `pending_geometry` 取）。
+pub const WM_APP_GEOMETRY: u32 = 0x8000 + 3;
+/// DPI 轮询线程 → UI 线程：窗口所在显示器 DPI 变了（wparam = 新 DPI）。
+///
+/// 为什么不能只靠 `WM_DPICHANGED`：本窗口的位置/尺寸由 `UpdateLayeredWindow`
+/// 的 pptDst/psize 决定，跨屏拖动不经过 `SetWindowPos`，系统不一定会发
+/// `WM_DPICHANGED`。轮询 `GetDpiForWindow` 是可靠兜底（2 s 一次，成本可忽略），
+/// 两条路径最终都进同一个 `App::on_dpi_changed`。
+pub const WM_APP_DPI: u32 = 0x8000 + 4;
+/// 托盘图标回调（wparam = 鼠标消息，lparam = 屏幕坐标）。
+pub const WM_APP_TRAY: u32 = 0x8000 + 5;
+
+pub fn post(raw: isize, msg: u32) {
+    unsafe {
+        let _ = PostMessageW(Some(HWND(raw as *mut c_void)), msg, WPARAM(0), LPARAM(0));
+    }
+}
 
 pub fn post_sample(raw: isize) {
+    post(raw, WM_APP_SAMPLE);
+}
+
+/// 投递 DPI 变化（wparam = 新 DPI，lparam = 0）。
+pub fn post_dpi(raw: isize, dpi: u32) {
     unsafe {
-        let _ = PostMessageW(Some(HWND(raw as *mut c_void)), WM_APP_SAMPLE, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(
+            Some(HWND(raw as *mut c_void)),
+            WM_APP_DPI,
+            WPARAM(dpi as usize),
+            LPARAM(0),
+        );
     }
 }
