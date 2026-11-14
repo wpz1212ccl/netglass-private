@@ -294,6 +294,9 @@ struct App {
 
     /// 最近一次左键抬起（双击判定用）与单调时钟基准。
     last_click: Option<input::Click>,
+    /// 上一击的**手势起点形态**：双击的第二击沿用它判定，避免被第一击改掉的
+    /// 形变目标（`effective_mode`）误判成「卡片双击」。
+    last_click_mode: Option<mode::UiMode>,
     click_t0: Instant,
     /// 按下起点与当前矩形（拖动阈值 / 点击判定）。
     press: Option<(POINT, i32, i32)>,
@@ -761,9 +764,21 @@ impl App {
             y: c.y,
         };
         let dbl = input::is_double_click(self.last_click, now);
+        // 双击的第二击必须沿用第一击的形态：第一击若已把形变目标改成卡片，
+        // `effective_mode()` 此刻已返回 Expanded，按它判定就会把卡片又收回去。
+        let mode_at_gesture_start = if dbl {
+            self.last_click_mode.unwrap_or_else(|| self.effective_mode())
+        } else {
+            self.effective_mode()
+        };
         self.last_click = if dbl { None } else { Some(now) };
-        match self.effective_mode() {
-            mode::UiMode::Expanded if dbl => {
+        self.last_click_mode = if dbl {
+            None
+        } else {
+            Some(mode_at_gesture_start)
+        };
+        match input::click_action(mode_at_gesture_start, dbl) {
+            Some(input::ClickAction::CollapseCard) => {
                 // 双击卡片：手动收回顶部胶囊，并压住桌面 2 s settle
                 MANUAL_ISLAND.store(1, Ordering::Relaxed);
                 if let Ok(mut g) = PIN_UNTIL.lock() {
@@ -776,7 +791,7 @@ impl App {
                 MODE.store(mode::mode_code(mode::UiMode::Island), Ordering::Relaxed);
                 self.apply_mode(mode::UiMode::Island);
             }
-            mode::UiMode::Island if !dbl => {
+            Some(input::ClickAction::ExpandIsland) => {
                 // 单击胶囊：立即展开并 pin 8 秒（前台窗口切走即失效）
                 MANUAL_ISLAND.store(0, Ordering::Relaxed);
                 if let Ok(mut g) = PIN_UNTIL.lock() {
@@ -2178,6 +2193,7 @@ fn run(args: &[String]) -> Result<()> {
         fade: None,
         fade_timer_on: false,
         last_click: None,
+        last_click_mode: None,
         click_t0: Instant::now(),
         press: None,
         press_moved: false,

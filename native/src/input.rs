@@ -6,6 +6,8 @@
 //!
 //! 这里不碰 Win32，时间由调用方以毫秒注入，因此可直接单测。
 
+use crate::mode::UiMode;
+
 /// 双击的时间窗（Windows 默认 500 ms）。
 pub const DOUBLE_CLICK_MS: u64 = 500;
 /// 双击允许的位移（物理 px）：手抖不能算两次不同位置。
@@ -35,6 +37,27 @@ pub fn is_double_click(last: Option<Click>, now: Click) -> bool {
 /// 位移是否够得上拖动。
 pub fn is_drag(start: (i32, i32), cur: (i32, i32)) -> bool {
     (cur.0 - start.0).abs() > DRAG_THRESHOLD_PX || (cur.1 - start.1).abs() > DRAG_THRESHOLD_PX
+}
+
+/// 一次左键抬起要执行的动作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClickAction {
+    /// 双击卡片：手动收回顶部胶囊。
+    CollapseCard,
+    /// 单击胶囊：展开并 pin。
+    ExpandIsland,
+}
+
+/// 点击语义由**手势起点形态**决定：双击的判定看第一击发生在哪一态。
+///
+/// 第一击在胶囊上会立刻把形变目标改成卡片，若第二击按「当前目标形态」判定，
+/// 就会被误判成「卡片双击」而把刚展开的卡片收回去。因此第二击沿用第一击的形态。
+pub fn click_action(mode_at_gesture_start: UiMode, dbl: bool) -> Option<ClickAction> {
+    match (mode_at_gesture_start, dbl) {
+        (UiMode::Expanded, true) => Some(ClickAction::CollapseCard),
+        (UiMode::Island, false) => Some(ClickAction::ExpandIsland),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -75,5 +98,32 @@ mod tests {
         assert!(!is_drag((500, 300), (503, 303)));
         assert!(is_drag((500, 300), (504, 300)));
         assert!(is_drag((500, 300), (500, 320)));
+    }
+
+    #[test]
+    fn double_click_started_on_island_does_not_collapse_the_card() {
+        // 第一击在胶囊上已经展开，第二击沿用起点形态：不再触发收回
+        assert_eq!(click_action(UiMode::Island, true), None);
+    }
+
+    #[test]
+    fn double_click_on_card_collapses_to_island() {
+        assert_eq!(
+            click_action(UiMode::Expanded, true),
+            Some(ClickAction::CollapseCard)
+        );
+    }
+
+    #[test]
+    fn single_click_on_island_expands() {
+        assert_eq!(
+            click_action(UiMode::Island, false),
+            Some(ClickAction::ExpandIsland)
+        );
+    }
+
+    #[test]
+    fn single_click_on_card_is_a_no_op() {
+        assert_eq!(click_action(UiMode::Expanded, false), None);
     }
 }
