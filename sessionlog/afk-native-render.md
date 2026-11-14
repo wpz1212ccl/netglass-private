@@ -1,9 +1,11 @@
 # AFK journal — 原生渲染切换（native-render）
 
-**状态**
-- 已完成：T1（D9 成立）、T2（29 绿，`a096467`）、T3 胶囊态（43 绿，`715b121`，#3 已关）、T4 展开卡片（58 绿，`57e1d4d`，#4 已关，root-only 全达标，rubric 8.8）、T5 形变/数字弹簧（84 绿，`0e744fe`，#5 已关，rubric 9.0）、T6 系统集成（114 绿，`6a66c6e`，#6 已关：托盘/快捷键/自启/config/单实例/DPI，7 项回归全过，用户注册表与 config 已恢复原值）
-- 进行中：T7 全量验收与收官（主 agent 亲自做：双轴 code-review → 修复轮 → spec §6 全表实测 → 演示采集 → 收官报告）
-- 下一步：T7 完成后交付报告，**停在合并门等用户点头**
+**状态（收官 · 2026-11-14）**
+- **全部 7 票关闭并已合并 main**：T1（D9 成立）、T2（29 绿，`a096467`）、T3（43 绿，`715b121`，rubric 8.5）、T4（58 绿，`57e1d4d`，rubric 8.8）、T5（84 绿，`0e744fe`，rubric 9.0）、T6（114 绿，`6a66c6e`）、T7（双轴 review 硬违规清零 `6e101e1`，spec §6 全表实测，收官报告 `.scratch/afk-report-native-render-2026-11-14.md`）。
+- **验收 hotfix**：用户验收发现双击岛态「弹出又弹回」→ 手势起点语义修复（`a2f0501`，`input::click_action` + 4 单测）→ 合并 `34816da`，118 绿。
+- **最终状态**：`main` HEAD `bc386c8`；分支已清（仅剩 main + origin/main）；worktree 全清；118 passed; 0 failed。
+- **未做（等用户单独指示）**：push origin main；部署切换（`dist\NetGlass.exe` 替换 + tag `webview-final`）；24h 泄漏观察（用户版复跑命令在收官报告）。
+- **悬而未决（收官报告「等你决定的事」）**：岛态 CPU 0.6581% 单核 >0.3%（动 D3 才能压进）；展开 WS 45.86 MB >40（字体实例/缓存精简需批准）。
 - **T4 视觉复核（主 agent 亲自看图）**：`card-default.png` / `card-hover.png` 里 35px squircle、Inter 数字「114/118」字距紧、5 格 hover 详情（延迟 23ms / 峰值 118 KB/s / 链路 243 Mbps / 上行峰值 30 KB/s / 代理 未加速）、蓝色曲线、底栏交叉淡出均在，层次符合 iOS 小组件范式。但两张图左侧有竖直暗带 + 小圆角矩形叠影；`desktop-full.png` 显示屏幕被最大化浏览器占满、左上角仍有常驻 WebView2 版 NetGlass 胶囊（「2.9 MB/s ↑ 148 KB/s」）→ **是常驻版叠在原生卡片左边缘，属证据构图问题、非产品缺陷**（goal §3a 已预警并存重叠）。已要求 T4 用 `--mode=expanded --pos` 摆到空白区 + `--hit` 探坐标补拍 clean 版。
 - **T4 主 agent 复跑 `--bench`**：paint **2.560 ms/帧**（T4 报 2.26，环境波动，均 <5 ms 门槛 → D9 仍成立）；`--selftest` 卡片 squircle 与胶囊 `d>=1.02` 像素 0 / max_alpha 0，且打印 `font Inter, collection sees Inter = true, weights=[400,450,500,560,600,...]`。`outside-samples` 前 8 点非零是因为旧椭圆采样点现在落在 squircle 内部（审计已改为 squircle 距离判定），逻辑自洽，T7 留意即可。
 - **T4 展开态测量复核（主 agent 按 CSV 独立复算）**：`measure-expanded.csv` 23 点 → sum_dcpu 4.1097s / sum_dt 233.45s = **1.7604% 单核 = 0.11% 整机**（<2% 阈值，**达标**）；逐点中位 1.6269 / p90 2.5146；Private 中位 23.41 MB（<25 达标）；**WS 中位 47.41 MB > 40 MB 阈值（未达标）**。CSV 恒 `n=2`，主 agent 独立核实 `Get-Process netglass-native` 物理只有 **1 个**进程（PID 13480，Start 1:10:29）且无子进程 → `n=2` 是测量脚本 `Get-TreeIds` 统计口径偏差（非真派生），spec「进程数=1」物理成立。WS 较 T3 岛态 23 MB 上涨归因：卡片玻璃离屏缓存 + Inter 5 静态实例 + 自定义 DWrite font collection（`--bench` 的 25.3/29.1 MB 是进程内阶段值，与常驻稳态不同口径）。已要求 T4 重测确认；若仍 >40 MB，按「内存部分达标、待用户决策」如实上报（与岛态 CPU 项并列）。
