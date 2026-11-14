@@ -102,13 +102,36 @@ impl Tray {
             };
             // owner 必须能成为前台，否则 TrackPopupMenu 收不到输入：菜单画得
             // 出来，但鼠标点不中、Esc 也关不掉，而 UI 线程被它阻塞 = 整个应用
-            // 假死（实测过）。所以先确认真拿到前台权，拿不到就**不弹**——
-            // 宁可这次菜单不出现，也不能把进程锁死（快捷键仍可解锁/切换）。
-            if !force_foreground(owner) {
-                log("tray menu: skipped (could not take foreground)");
-                let _ = DestroyMenu(menu);
-                return None;
+            // 假死（实测过）。策略（T8 修订，用户反馈"右键菜单消失"）：
+            // ① 先尽力抢前台（attach shell 线程 + SetForegroundWindow）；
+            // ② 拿不到也**照弹**——TrackPopupMenu 的输入路由到 owner 窗口，
+            //    owner 是可激活的普通窗口，绝大多数场景可用；WebView 版
+            //    （tauri 托盘）从不预检前台权，行为对齐它。
+            // ③ 假死兜底：后台线程 4s 后若菜单仍开着（前台仍未回到 owner），
+            //    PostMessageW(WM_CANCELMODE) 强制关闭菜单，UI 线程解锁。
+            let got_fg = force_foreground(owner);
+            if !got_fg {
+                log("tray menu: foreground not acquired; showing menu anyway (cancel-watch armed)");
             }
+            // 看门狗：4s 后若本线程仍在 TrackPopupMenu 里（菜单模态标志仍在），
+            // 发 WM_CANCELMODE 关菜单——TrackPopupMenu 返回 0，等价"取消"。
+            let owner_raw = owner.0 as isize;
+            let cancel = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(4000));
+                // 若前台已是 owner，说明菜单正常交互中/已结束，不动。
+                let fg = unsafe { GetForegroundWindow() };
+                if !fg.is_invalid() && fg.0 as isize == owner_raw {
+                    return;
+                }
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(owner_raw as *mut _)),
+                        WM_CANCELMODE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            });
             let id = TrackPopupMenu(
                 menu,
                 TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
@@ -118,6 +141,7 @@ impl Tray {
                 owner,
                 None,
             );
+            let _ = cancel.join();
             let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
             let _ = DestroyMenu(menu);
             menu::action_of(id.0 as usize)

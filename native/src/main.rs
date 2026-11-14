@@ -1,3 +1,8 @@
+// GUI 子系统：不派生 conhost 控制台（双击/自启时不再弹黑窗口）。
+// 诊断输出（--bench/--selftest 等）在 release 下仍走 stdout——从已有
+// 终端里运行时照常可见；只是不再由系统自动配一个控制台。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! NetGlass native widget.
 //!
 //! A layered window (`WS_EX_LAYERED` + `UpdateLayeredWindow`) whose alpha channel
