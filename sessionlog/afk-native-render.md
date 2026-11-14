@@ -255,3 +255,9 @@ test result: ok. 114 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fi
 **文档同步**：docs/index.md 已登记 native crate；spec 头部状态标记待用户点头后做（P5-3 是部署切换的一部分）。
 
 **票 #7 已关**（证据评论）。全部 7 票关闭。收官报告交付 → **停在合并门**。
+
+## hotfix · 双击灵动岛回弹（合并入 main）
+
+- Did: 用户验收报「双击胶囊态 → 卡片弹出后又弹回」。根因：`on_click` 用 `effective_mode()`（形变途中返回 morph 目标）判定，第 1 击在胶囊上已把目标改成 Expanded，第 2 击（500ms 内）因此命中 `Expanded if dbl` 分支收回卡片。修复采用**手势起点语义**：新增纯函数 `input::click_action(mode_at_gesture_start, dbl)`（`ClickAction::{CollapseCard, ExpandIsland}`）+ `App.last_click_mode` 记录上一击形态，双击的第二击沿用第一击的形态。`apply_mode` 早退、morph 状态机、`effective_mode` 本体一律未动。
+- Verified: `cd native && cargo test --quiet` → **118 passed; 0 failed**（114 + 4 新单测）；`cargo build --release` 通过。PostMessage 探针三场景（exp6.ps1，新 exe 覆盖 ASCII 路径）：island-double gap150 → 480×300 保持到 2374ms 采样结束（修复前 t≈1032ms 起缩回）；island-single → 480×300 保持；card-double gap120 → 收回到 216×51（T5 不变量）。护栏 `git status --short src-tauri src` 空，diff 仅 native/src/{main,input}.rs。
+- 合并：`a2f0501`（fix）→ `34816da`（merge --no-ff 入 main），分支 `feat/native-render` 已删。未 push、未动 dist、未打 tag。
