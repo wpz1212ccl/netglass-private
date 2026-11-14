@@ -3,21 +3,29 @@ target/
 dist/
 src-tauri/gen/schemas/
 
-# Debug / scratch artifacts
+# Debug / scratch artifacts (measurement scripts, CSVs, screenshots — local only)
 .scratch/
 .workbuddy/
+spike-s1/
+prototype/
 *.log
 *-log.txt
+*.csv
+!docs/perf-2026-11-12/*.csv
 
-# Screenshots, prototypes, demos
-prototype/
+# Session logs (agent work journals — contain machine paths, PIDs, local state)
+sessionlog/
+
+# Screenshots, demos, temp exports
 *.mp4
-
-# Spikes kept local until folded into the app
-spike-s1/
+*.webm
 
 # Editor / OS
 .vscode/
 .idea/
 Thumbs.db
 desktop.ini
+
+# Backup artifacts
+*.bak
+*.webview-backup*
