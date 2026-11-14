@@ -414,16 +414,23 @@ pub fn dump_icon() {
 }
 
 /// 左键/右键的判定（V4 回调里 wparam 低字是鼠标消息）。
+///
+/// **NOTIFYICON_VERSION_4 语义（T8 修订，用户反馈"右键托盘无反应"）**：
+/// V4 下托盘回调不再发 `WM_LBUTTONUP`/`WM_RBUTTONUP`——
+/// 选择/激活发 `NIN_SELECT`，右键（上下文菜单）发 `WM_CONTEXTMENU`。
+/// 只认旧消息 = 右键永远不进弹菜单分支、左键显/隐失效。
 pub fn mouse_message(wp: usize) -> u32 {
     (wp & 0xFFFF) as u32
 }
 
 pub fn is_left_up(msg: u32) -> bool {
-    msg == WM_LBUTTONUP
+    // NIN_SELECT 在 Shell 模块（V4 选择/激活通知）。
+    const NIN_SELECT: u32 = 1024u32;
+    msg == WM_LBUTTONUP || msg == NIN_SELECT
 }
 
 pub fn is_right_up(msg: u32) -> bool {
-    msg == WM_RBUTTONUP
+    msg == WM_RBUTTONUP || msg == WM_CONTEXTMENU
 }
 
 /// V4 回调里 lparam 是**屏幕坐标**（低字 x、高字 y，按有符号 16 位打包）。
@@ -461,6 +468,13 @@ mod tests {
         assert!(is_left_up(WM_LBUTTONUP));
         assert!(is_right_up(WM_RBUTTONUP));
         assert!(!is_left_up(WM_RBUTTONDOWN));
+        // V4 托盘语义：选择 = NIN_SELECT，右键 = WM_CONTEXTMENU（旧消息在
+        // V4 下不会到达）。
+        const NIN_SELECT: u32 = 1024u32;
+        assert!(is_left_up(NIN_SELECT), "V4 left/keyboard select");
+        assert!(is_right_up(WM_CONTEXTMENU), "V4 right-click context menu");
+        assert!(!is_right_up(NIN_SELECT));
+        assert!(!is_left_up(WM_CONTEXTMENU));
     }
 
     #[test]
